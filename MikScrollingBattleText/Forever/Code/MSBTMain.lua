@@ -1722,6 +1722,16 @@ end
 local damageMeterLastTotals = {}
 local damageMeterTicker
 
+-- Meter deltas are aggregated per spell name and flushed every
+-- METER_FLUSH_INTERVAL seconds instead of being emitted raw every 0.5s poll.
+-- Emitting per-poll deltas read as the damage being split into many small
+-- pieces (and MSBT's merge window, MERGE_DELAY_TIME = 0.3s, could never
+-- coalesce events arriving 0.5s apart). Keying by spell name also coalesces
+-- the per-rank entries Classic can produce for the same spell.
+local METER_FLUSH_INTERVAL = 1.0
+local pendingMeterEvents = {}
+local lastMeterFlushTime = 0
+
 -- ****************************************************************************
 -- Polls one C_DamageMeter type (damage or healing) for the player and turns
 -- any newly-accumulated amount per spell into a synthetic outgoing event.
@@ -1751,16 +1761,36 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 			damageMeterLastTotals[key] = totalAmount
 
 			if delta > 0 then
-				ParserEventsHandler({
-					eventType = eventType,
-					sourceUnit = "player",
-					amount = delta,
-					skillID = spellID,
-					skillName = GetSpellInfo(spellID),
-				})
+				-- Accumulate per spell name and flush on the aggregation window
+				-- (see FlushPendingMeterEvents below).
+				local spellName = GetSpellInfo(spellID)
+				local pendingKey = damageMeterType .. ":" .. (spellName or tostring(spellID))
+				local pending = pendingMeterEvents[pendingKey]
+				if not pending then
+					pending = { eventType = eventType, spellID = spellID, spellName = spellName, amount = 0 }
+					pendingMeterEvents[pendingKey] = pending
+				end
+				pending.amount = pending.amount + delta
 			end
 		end
 	end
+end
+
+-- ****************************************************************************
+-- Emits the aggregated meter deltas: one event per spell per window, all in a
+-- single frame so MSBT's own merge pipeline can coalesce further.
+-- ****************************************************************************
+local function FlushPendingMeterEvents()
+	for _, pending in pairs(pendingMeterEvents) do
+		ParserEventsHandler({
+			eventType = pending.eventType,
+			sourceUnit = "player",
+			amount = pending.amount,
+			skillID = pending.spellID,
+			skillName = pending.spellName,
+		})
+	end
+	EraseTable(pendingMeterEvents)
 end
 
 -- ****************************************************************************
@@ -1778,6 +1808,13 @@ local function PollDamageMeter()
 	-- (UNIT_COMBAT can't attribute a heal to a caster, and self-heals would
 	-- otherwise show up twice), so nothing stands it down here.
 	PollDamageMeterSource(Enum.DamageMeterType.HealingDone, "heal")
+
+	-- Flush the aggregated deltas on the window so the combat text shows one
+	-- line per spell per window instead of a fragment every poll.
+	if GetTime() - lastMeterFlushTime >= METER_FLUSH_INTERVAL then
+		lastMeterFlushTime = GetTime()
+		FlushPendingMeterEvents()
+	end
 end
 
 -- ****************************************************************************
@@ -1790,6 +1827,8 @@ local function StartDamageMeterFallback()
 		return
 	end
 	for key in pairs(damageMeterLastTotals) do damageMeterLastTotals[key] = nil end
+	EraseTable(pendingMeterEvents)
+	lastMeterFlushTime = GetTime()
 	damageMeterTicker = C_Timer.NewTicker(0.5, PollDamageMeter)
 end
 
@@ -1801,6 +1840,10 @@ local function StopDamageMeterFallback()
 		damageMeterTicker:Cancel()
 		damageMeterTicker = nil
 	end
+
+	-- Show any accumulated damage/healing from the tail of the fight instead
+	-- of dropping it because the next flush never came.
+	FlushPendingMeterEvents()
 end
 
 

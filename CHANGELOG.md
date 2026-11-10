@@ -3,6 +3,21 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.2] - 2026-11-10
+
+### Fixed
+- **Outgoing damage no longer appears fragmented into many small pieces.**
+  The `C_DamageMeter` feed emitted a separate display event per spell on every
+  0.5s poll, and MSBT's AoE merge window (`MERGE_DELAY_TIME = 0.3s`) could
+  never coalesce events arriving 0.5s apart - continuous damage (DoTs,
+  multi-hits, channels) read as the damage being split into pieces. Meter
+  deltas are now accumulated per spell name (also coalescing the per-rank
+  entries Classic can produce for the same spell) and flushed as a single
+  event per spell every 1.0s, all in one frame so MSBT's merge pipeline can
+  coalesce further.
+- The tail of a fight is no longer dropped: pending aggregated deltas are
+  flushed when combat ends.
+
 ## [1.1.1] - 2026-11-10
 
 ### Fixed
