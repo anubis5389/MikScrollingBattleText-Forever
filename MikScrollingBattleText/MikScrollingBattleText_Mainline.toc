@@ -1,0 +1,38 @@
+## Interface: 16001
+#
+# Named "_Mainline", not "_Forever": the Forever client reports
+# WOW_PROJECT_ID as WOW_PROJECT_MAINLINE, so WoW's TOC-flavor selection
+# only looks for "_Mainline" - a "_Forever"-suffixed file is confirmed to
+# not load at all there (silently, no error). Do not rename this file.
+# Still loads the Forever/ code tree (Classic content), not Retail.
+## Version: 1.0.6
+## Title: Mik's Scrolling Battle Text
+## Author: Mikord
+## Notes: Scrolls battle information around the character model.
+## IconTexture: Interface\AddOns\MikScrollingBattleText\Artwork\MinimapIcon
+## SavedVariables: MSBTProfiles_SavedVars, MSBT_SavedMedia
+## SavedVariablesPerCharacter: MSBTProfiles_SavedVarsPerChar
+## OptionalDeps: LibSharedMedia-3.0
+
+Libs\LibStub.lua
+Libs\CallbackHandler-1.0.lua
+Libs\LibSharedMedia-3.0.lua
+
+Forever\Code\MikSBT.lua
+Localization\localization.xml
+Forever\Code\MSBTProfiles.lua
+Forever\Code\MSBTParser.lua
+Forever\Code\MSBTMedia.lua
+Forever\Code\MSBTAnimations.lua
+Forever\Code\MSBTTriggers.lua
+Forever\Code\MSBTCooldowns.lua
+Forever\Code\MSBTLoot.lua
+Forever\Code\MSBTMain.lua
+Forever\Code\MSBTAnimationStyles.lua
+Forever\Code\MSBTMinimapButton.lua
+
+Forever\MSBTOptions\Localization\localization.xml
+Forever\MSBTOptions\MSBTOptionsControls.lua
+Forever\MSBTOptions\MSBTOptionsPopups.lua
+Forever\MSBTOptions\MSBTOptionsMain.lua
+Forever\MSBTOptions\MSBTOptionsTabs.lua

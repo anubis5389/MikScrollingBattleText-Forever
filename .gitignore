@@ -1,0 +1,15 @@
+# Upstream reference clones (read-only, have their own .git)
+/upstream-midnight/
+/upstream-neergy/
+
+# Python
+__pycache__/
+*.pyc
+
+# Packaging artifacts
+*.zip
+/release/
+
+# OS / editor
+Thumbs.db
+.DS_Store
