@@ -3,6 +3,34 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.1] - 2026-11-10
+
+### Fixed
+- **Damage from other players no longer shows as yours in groups.** On Forever,
+  `UNIT_COMBAT` on the target can't tell *who* dealt the hit, so party members
+  attacking the same target (any class, including the same class as the player)
+  were displayed as the player's own outgoing damage. The player-only
+  `C_DamageMeter` feed is now the sole authority for outgoing damage while in a
+  group; the `UNIT_COMBAT` target path stands down entirely (wounds and misses).
+  In solo play `UNIT_COMBAT` remains authoritative (per-hit detail, crits,
+  schools).
+- **Duplicate outgoing damage eliminated.** Previously the `C_DamageMeter`
+  fallback and the `UNIT_COMBAT` target path could both deliver the same hit
+  (meter delta + individual wound). A strict authority split (group = meter,
+  solo = `UNIT_COMBAT`, flagged via `unitCombatOutgoingSeen` with resets on
+  combat start and `GROUP_ROSTER_UPDATE`) guarantees exactly one source per hit.
+- **Self-heal duplication removed.** Heals were shown twice: once from
+  `UNIT_COMBAT` on the player (misattributed as a self-heal via cast
+  correlation) and once from the `C_DamageMeter` healing-done feed.
+  Outgoing healing now comes exclusively from the meter; `UNIT_COMBAT` no
+  longer emits heal events (it can't attribute a heal to a caster, so heals
+  from other players on the player were also being misattributed as self-heals).
+
+### Changed
+- Removed the meter/`UNIT_COMBAT` overlap heuristics
+  (`meterDeliveredThisCombat`, `lastMeterDeltaTime` window) in favor of the
+  strict authority split.
+
 ## [1.1.0] - 2026-11-10
 
 First release of the dedicated WoW: Forever fork (based on NeeRgY/MSBT v1.0.6,

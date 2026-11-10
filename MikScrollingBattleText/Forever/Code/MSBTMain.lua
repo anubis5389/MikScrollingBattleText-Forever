@@ -141,8 +141,9 @@ local eventHandlers = {}
 -- the Forever-only UNIT_COMBAT / damage meter fallbacks stand down.
 local incomingLogSeen, outgoingLogSeen = false, false
 local lastPlayerSpellID, lastPlayerSpellTime = nil, 0
-local lastMeterDeltaTime = 0
-local meterDeliveredThisCombat = false
+-- Forever: set when UNIT_COMBAT delivers an outgoing hit (solo); makes the
+-- C_DamageMeter fallback stand down so the same hit is never shown twice.
+local unitCombatOutgoingSeen = false
 local damageTypeMap = {}
 local damageColorProfileEntries = {}
 local powerTokens = {}
@@ -1750,8 +1751,6 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 			damageMeterLastTotals[key] = totalAmount
 
 			if delta > 0 then
-				lastMeterDeltaTime = GetTime()
-				meterDeliveredThisCombat = true
 				ParserEventsHandler({
 					eventType = eventType,
 					sourceUnit = "player",
@@ -1768,8 +1767,16 @@ end
 -- Polls both damage and healing done by the player.
 -- ****************************************************************************
 local function PollDamageMeter()
-	if outgoingLogSeen then return end
-	PollDamageMeterSource(Enum.DamageMeterType.DamageDone, "damage")
+	-- Damage: stand down when the combat log (other clients) or UNIT_COMBAT
+	-- (solo on Forever) is already delivering the player's outgoing hits, so
+	-- the same hit is never shown twice.
+	if not (outgoingLogSeen or unitCombatOutgoingSeen) then
+		PollDamageMeterSource(Enum.DamageMeterType.DamageDone, "damage")
+	end
+
+	-- Healing done: the meter is the sole source for outgoing heals on Forever
+	-- (UNIT_COMBAT can't attribute a heal to a caster, and self-heals would
+	-- otherwise show up twice), so nothing stands it down here.
 	PollDamageMeterSource(Enum.DamageMeterType.HealingDone, "heal")
 end
 
@@ -1783,7 +1790,6 @@ local function StartDamageMeterFallback()
 		return
 	end
 	for key in pairs(damageMeterLastTotals) do damageMeterLastTotals[key] = nil end
-	meterDeliveredThisCombat = false
 	damageMeterTicker = C_Timer.NewTicker(0.5, PollDamageMeter)
 end
 
@@ -1822,16 +1828,31 @@ function eventFrame:PLAYER_REGEN_DISABLED()
 		DisplayEvent(eventSettings, eventSettings.message)
 	end
 
+	-- Fresh combat: UNIT_COMBAT (solo) takes the outgoing lead again until it
+	-- actually delivers, at which point the damage meter stands down.
+	unitCombatOutgoingSeen = false
+
 	StartDamageMeterFallback()
 end
 
 
 -- ****************************************************************************
--- Forever fallback: the combat log delivers nothing usable there, so
--- damage/heals/misses are derived from UNIT_COMBAT instead, attributed to
--- whichever spell the player last cast. Stands down per-direction once a
--- real combat log event for the player has been parsed (see incomingLogSeen/
--- outgoingLogSeen above), so nothing is ever shown twice.
+-- Regrouping mid-combat switches the outgoing authority (meter <-> UNIT_COMBAT);
+-- reset the stand-down flag so the new authority takes over cleanly.
+-- ****************************************************************************
+function eventFrame:GROUP_ROSTER_UPDATE()
+	unitCombatOutgoingSeen = false
+end
+
+
+-- ****************************************************************************
+-- Forever fallback: the combat log delivers nothing usable there, so outgoing
+-- damage/misses (solo) and incoming damage/misses are derived from UNIT_COMBAT,
+-- attributed to whichever spell the player last cast. Outgoing healing always
+-- comes from the C_DamageMeter feed instead (see PollDamageMeter - UNIT_COMBAT
+-- can't attribute heals). Each direction stands down once another source
+-- delivers it (see incomingLogSeen/outgoingLogSeen/unitCombatOutgoingSeen),
+-- so nothing is ever shown twice.
 -- ****************************************************************************
 -- Secret strings (e.g. UnitName("target") in combat) can't be compared or
 -- merged on, so drop them from the synthetic events below.
@@ -1881,13 +1902,22 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 	if isWound and amount ~= nil and not (issecretvalue and issecretvalue(amount)) and amount <= 0 then return end
 
 	-- Outgoing damage/misses: UNIT_COMBAT on the target, attributed to the last
-	-- spell the player cast. Skipped while the damage meter is delivering.
+	-- spell the player cast.
+	--
+	-- Forever authority split (only the player's own damage, never twice):
+	--   * Group: UNIT_COMBAT on the target can't tell WHO dealt the hit, so
+	--     party members attacking the same target would show up as the
+	--     player's own damage. The player-only C_DamageMeter feed is the sole
+	--     authority there and UNIT_COMBAT stands down entirely (wounds AND
+	--     misses). If the meter API is unavailable, UNIT_COMBAT stays as the
+	--     last resort (nothing else delivers, so no duplication is possible).
+	--   * Solo: UNIT_COMBAT is authoritative (per-hit detail, crits, misses,
+	--     damage schools) and flags it so the meter stands down (see
+	--     PollDamageMeter) instead of re-showing the same hits as aggregates.
 	if unitTarget == "target" then
 		if outgoingLogSeen or not InCombatLockdown() then return end
-		-- In a group, UNIT_COMBAT also reports party members' damage on the target;
-		-- once the damage meter (player-only) is delivering, rely on it instead.
-		if isWound and meterDeliveredThisCombat and IsInGroup() then return end
-		if isWound and GetTime() - lastMeterDeltaTime < 1 then return end
+		if IsInGroup() and damageMeterAvailable() then return end
+		unitCombatOutgoingSeen = true
 
 		local skillID, skillName
 		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 4 then
@@ -1920,21 +1950,14 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 	if isWound then
 		ParserEventsHandler({eventType = "damage", recipientUnit = "player", amount = amount, isCrit = isCrit,
 			damageType = (schoolMask and not (issecretvalue and issecretvalue(schoolMask))) and schoolMask or nil})
-	elseif action == "HEAL" then
-		-- Attribute to the player's own last cast (a self heal) when there is
-		-- one; UNIT_COMBAT doesn't say who healed.
-		local playerName = NonSecret(UnitName("player"))
-		local skillID, skillName, sourceName
-		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 4 then
-			skillID = lastPlayerSpellID
-			skillName = GetSpellInfo(skillID)
-			sourceName = playerName
-		end
-		ParserEventsHandler({eventType = "heal", recipientUnit = "player", sourceName = sourceName, recipientName = playerName,
-			amount = amount, isCrit = isCrit, skillID = skillID, skillName = skillName})
 	elseif isMiss then
 		ParserEventsHandler({eventType = "miss", recipientUnit = "player", missType = action})
 	end
+	-- Note: heals on the player are intentionally NOT delivered here.
+	-- UNIT_COMBAT can't say who cast the heal, so a heal from another player
+	-- would be misattributed as the player's own, and self-heals would show up
+	-- twice (here and in the C_DamageMeter healing-done feed, which is the sole
+	-- outgoing-heal source on Forever - see PollDamageMeter).
 end
 
 
@@ -1969,6 +1992,7 @@ local function Enable()
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_SENT")
+		eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 	end
 
 	-- Register the parser events handler.

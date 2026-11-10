@@ -78,16 +78,40 @@ CHAT_MSG_MONSTER_EMOTE ───┘         ▼
 ### 3.1 Fallback Forever en `MSBTMain.lua`
 
 Activado solo si `MikSBT.Client.isForever` (registro de eventos en `Enable()`).
-Cada dirección ("stand-down") se apaga cuando el combat log real entrega un
-evento válido (`incomingLogSeen` / `outgoingLogSeen`) — en Forever nunca ocurre,
-por lo que el fallback permanece activo toda la sesión.
+Cada dirección ("stand-down") se apaga cuando otra fuente entrega el evento
+(`incomingLogSeen` / `outgoingLogSeen` / `unitCombatOutgoingSeen`) — en Forever
+el combat log nunca entrega, por lo que el fallback permanece activo toda la
+sesión.
 
-- **Outgoing (target):** `UNIT_COMBAT(target, WOUND|MISS...)` → atribuido al
-  último cast del jugador (`lastPlayerSpellID`, ventana de 4 s). En grupo, cede
-  al medidor si este ya está entregando (`meterDeliveredThisCombat` + `IsInGroup()`),
-  y respeta 1 s tras el último delta del medidor para no duplicar.
-- **Incoming (player):** `WOUND` → daño; `HEAL` → curación (autocuración si hay
-  cast propio reciente); `MISS`/`DODGE`/... → evento miss.
+**Separación de autoridad para el daño/curación salientes** (garantiza "solo mi
+daño, nunca duplicado"):
+
+| Contexto | Daño saliente | Misses salientes | Curación saliente |
+|---|---|---|---|
+| **Grupo** (`IsInGroup()`) | `C_DamageMeter` (única autoridad) | no se muestran (inatribuibles) | `C_DamageMeter` |
+| **Solitario** | `UNIT_COMBAT` (por golpe, con críticos/escuela) | `UNIT_COMBAT` | `C_DamageMeter` |
+| Grupo sin API `C_DamageMeter` | `UNIT_COMBAT` (último recurso) | `UNIT_COMBAT` | — |
+
+Razones de diseño:
+
+- En grupo, `UNIT_COMBAT(target, ...)` no distingue al atacante: cualquier
+  compañero golpeando al mismo target aparecía como daño propio. Por eso el
+  camino de target se retira por completo cuando el medidor está disponible.
+- En solitario, la primera entrega de `UNIT_COMBAT` activa
+  `unitCombatOutgoingSeen`, que hace retirar el poll de daño del medidor
+  (`PollDamageMeter`) — el mismo golpe nunca se muestra dos veces.
+- La bandera se resetea al entrar en combate (`PLAYER_REGEN_DISABLED`) y en
+  `GROUP_ROSTER_UPDATE` (cambio de autoridad limpio al entrar/salir de grupo
+  en mitad de un combate).
+- **Curación**: `UNIT_COMBAT` no emite eventos de curación en absoluto (no se
+  puede atribuir el caster; una curación de otro jugador sobre ti se mostraría
+  como autocuración tuya, y las autocuraciones se duplicarían con el medidor).
+  El medidor cubre toda la sanación hecha, incluidas autocuraciones.
+
+- **Outgoing (target, solitario):** `UNIT_COMBAT(target, WOUND|MISS...)` →
+  atribuido al último cast del jugador (`lastPlayerSpellID`, ventana de 4 s).
+- **Incoming (player):** `WOUND` → daño con crítico por substring y escuela vía
+  `schoolMask`; `MISS`/`DODGE`/... → evento miss.
 - **Medidor:** `C_DamageMeter.GetCombatSessionSourceFromType` polled cada 0.5 s
   en combate; convierte deltas de totales por hechizo en eventos sintéticos.
   `SafeAddZero` (pcall `value + 0`) detecta y descarta valores secretos en esa vía.

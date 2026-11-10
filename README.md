@@ -77,13 +77,20 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
 
 ### Limitaciones conocidas (por diseño de la API de Forever)
 
-- La **curación saliente sobre otros** llega sin detalle por golpe: se muestra vía el
-  fallback `C_DamageMeter` (totales por hechizo, cada 0.5 s), no por golpe individual.
-- En **grupo**, el daño sobre tu target de otros compañeros no se puede distinguir
-  por `UNIT_COMBAT`; el addon lo delega al medidor (solo jugador) cuando está
-  activo y en grupo.
-- Los triggers que dependían de subeventos del combat log (p. ej. detectar el hechizo
-  exacto de un proc) no disponen de ese feed; el resto de triggers funciona.
+- **Solo tu daño, una sola vez**: en grupo, el daño/curación salientes provienen
+  exclusivamente del medidor `C_DamageMeter` (solo-jugador; totales por hechizo
+  cada 0.5 s, sin detalle por golpe ni críticos) porque `UNIT_COMBAT` no permite
+  atribuir golpes a un atacante concreto. En solitario, `UNIT_COMBAT` manda
+  (detalle por golpe, críticos, escuelas) y el medidor se retira, evitando
+  duplicados.
+- La **curación saliente** (incluida la autocuración) llega siempre vía el
+  medidor como totales agregados; no hay feed por golpe de curación saliente en
+  Forever.
+- Las curaciones de otros jugadores sobre ti no se muestran (no se pueden
+  atribuir a un caster).
+- Los triggers que dependían de subeventos del combat log (p. ej. detectar el
+  hechizo exacto de un proc) no disponen de ese feed; el resto de triggers
+  funciona.
 
 ## Restaurar el texto de combate de Blizzard
 
