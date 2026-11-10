@@ -99,6 +99,8 @@ ejecutables directamente sin que el agente tenga que reescribirlos.
 | 1 | Borrador inicial del `SKILL.md` (con contenido inline completo) | El flujo de 6 fases y las reglas de oro quedaron definidos; se decidió mover los patrones Lua extensos a `references/` para cumplir la guía de <500 líneas |
 | 2 | Escritura de las 3 referencias y 2 scripts | Scripts con autodetección de ruta de WoW y severidades ERROR/WARN |
 | 3 | Evals + registro | Skill registrado y disponible en la sesión (`system-update` confirmó su carga) |
+| 4 | **Corrección por uso real** (misma sesión): al ejecutar el port de MSBT se descubrió que el análisis inicial del blueprint era erróneo — el fork NeeRgY v1.0.6 ya incluye fallbacks `UNIT_COMBAT` + `C_DamageMeter` con guardas de secret values. Se actualizó `references/msbt-forever-blueprint.md` con la estrategia validada (NeeRgY como base, port de gaps puntuales en vez de transplante del parser Midnight) y con la lista real de gaps encontrados | El skill queda alineado con la realidad verificada en código |
+| 5 | **Ajuste del auditor** (`audit-forever-compat.ps1`): el primer run marcó 59 "errores" que eran falsos positivos (convención de alias `MikSBT.GetSpellInfo` = wrapper `C_Spell.*` seguro; rutas CLEU con guardas o muertas). Se recalibraron severidades: ERROR solo para riesgos reales (`UnitBuff` sin wrapper, TOC `_Forever`), WARN para verificación | Run final: 0 errores, 57 warnings documentados |
 
 ## 8. Validación
 
