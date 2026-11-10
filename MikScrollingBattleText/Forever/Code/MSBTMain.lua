@@ -26,6 +26,7 @@ local table_remove = table.remove
 local string_find = string.find
 local string_gsub = string.gsub
 local string_format = string.format
+local string_sub = string.sub
 local math_abs = math.abs
 local bit_bor = bit.bor
 local FormatLargeNumber = FormatLargeNumber
@@ -349,11 +350,20 @@ local function FormatEvent(message, amount, damageType, overhealAmount, overkill
 	local currentProfile = MSBTProfiles.currentProfile
 	local checkParens
 
+	-- Forever: a secret amount turns the message into a secret string, which
+	-- none of the pattern-based substitutions below can operate on. When the
+	-- amount is secret it is spliced into the message at the very end of this
+	-- function instead (see the pendingSecretAmount logic at the bottom).
+	local pendingSecretAmount
+
 	-- Substitute amount.
 	if amount and string_find(message, "%a", 1, true) then
 		-- Check if there is overheal information and displaying it is enabled.
+		-- Forever: overheal/overkill amounts can be secret values; arithmetic and
+		-- comparisons on them throw, so skip the partial effect logic for those.
 		local partialAmount = ""
-		if overhealAmount and overhealAmount > 0 and not currentProfile.overheal.disabled then
+		local isSecretAmount = issecretvalue and issecretvalue(amount)
+		if overhealAmount and not (issecretvalue and issecretvalue(overhealAmount)) and overhealAmount > 0 and not currentProfile.overheal.disabled then
 			-- Deduct the overheal amount from the total amount healed.
 			amount = amount - overhealAmount
 
@@ -373,7 +383,7 @@ local function FormatEvent(message, amount, damageType, overhealAmount, overkill
 			end
 
 		-- No overheal so check if there is overkill information and displaying it is enabled.
-		elseif overkillAmount and overkillAmount > 0 and not currentProfile.overkill.disabled then
+		elseif overkillAmount and not (issecretvalue and issecretvalue(overkillAmount)) and overkillAmount > 0 and not currentProfile.overkill.disabled then
 			-- Deduct the overkill amount from the total amount of damage done.
 			amount = amount - overkillAmount
 
@@ -399,10 +409,13 @@ local function FormatEvent(message, amount, damageType, overhealAmount, overkill
 		--if (powerType == powerTypes["ECLIPSE"]) then formattedAmount = math_abs(amount) end
 
 		-- Shorten amount with SI suffixes or separate into digit groups depending on options.
-		if currentProfile.shortenNumbers then
-			formattedAmount = ShortenNumber(formattedAmount, currentProfile.shortenNumberPrecision)
-		elseif currentProfile.groupNumbers then
-			formattedAmount = FormatLargeNumber(formattedAmount)
+		-- Forever: secret amounts can't be shortened or grouped; pass them through raw.
+		if not (isSecretAmount or (issecretvalue and issecretvalue(formattedAmount))) then
+			if currentProfile.shortenNumbers then
+				formattedAmount = ShortenNumber(formattedAmount, currentProfile.shortenNumberPrecision)
+			elseif currentProfile.groupNumbers then
+				formattedAmount = FormatLargeNumber(formattedAmount)
+			end
 		end
 
 		-- Get the hex color for the damage type if there is one and coloring is enabled.
@@ -415,7 +428,14 @@ local function FormatEvent(message, amount, damageType, overhealAmount, overkill
 		end -- Damage type and damage coloring is enabled.
 
 		-- Substitute all %a event codes with the amount.
-		message = string_gsub(message, "%%a", formattedAmount .. partialAmount)
+		-- Forever: string.gsub refuses secret values, and once a secret is
+		-- spliced into the message no pattern work is possible on it. Defer the
+		-- splice to the end of this function for secret amounts.
+		if isSecretAmount or (issecretvalue and issecretvalue(formattedAmount)) then
+			pendingSecretAmount = formattedAmount .. partialAmount
+		else
+			message = string_gsub(message, "%%a", formattedAmount .. partialAmount)
+		end
 	end -- Substitute amount.
 
 
@@ -522,6 +542,20 @@ local function FormatEvent(message, amount, damageType, overhealAmount, overkill
 	-- Append the merge trailer if there is one.
 	if mergeTrailer then
 		message = message .. mergeTrailer
+	end
+
+	-- Forever: splice a secret amount last using plain find + concat. This runs
+	-- after all other substitutions because a message containing a secret value
+	-- can't be used with string.gsub/string_find patterns anymore.
+	if pendingSecretAmount then
+		local out, rest = "", message
+		while true do
+			local startPos, endPos = string_find(rest, "%a", 1, true)
+			if not startPos then break end
+			out = out .. string_sub(rest, 1, startPos - 1) .. pendingSecretAmount
+			rest = string_sub(rest, endPos + 1)
+		end
+		message = out .. rest
 	end
 
 	-- Return the formatted message.
@@ -882,7 +916,9 @@ local function DamageHandler(parserEvent, currentProfile)
 	end
 
 	-- Ignore the event if the damage amount is under the damage threshold to be shown.
-	if parserEvent.amount and parserEvent.amount < currentProfile.damageThreshold then
+	-- Forever: amounts can be secret values in combat, which can't be compared;
+	-- secret amounts are always shown instead of being dropped.
+	if parserEvent.amount and not (issecretvalue and issecretvalue(parserEvent.amount)) and parserEvent.amount < currentProfile.damageThreshold then
 		return
 	end
 
@@ -948,7 +984,7 @@ local function HealHandler(parserEvent, currentProfile)
 
 	local isHoT = parserEvent.isHoT
 	local amount = parserEvent.amount
-	if amount then
+	if amount and not (issecretvalue and issecretvalue(amount)) then
 		-- Ignore the event if the heal amount is under the healing threshold to be shown.
 		if amount < currentProfile.healThreshold then
 			return
@@ -1300,6 +1336,12 @@ local function ParserEventsHandler(parserEvent)
 	local handler = eventHandlers[eventType]
 	if handler then
 		eventTypeString, effectName, affectedUnitName, affectedUnitClass, mergeEligible = handler(parserEvent, currentProfile)
+
+	-- Forever: merging totals amounts with arithmetic, which throws on secret
+	-- values; force direct display for secret amounts instead of merging them.
+	if mergeEligible and parserEvent.amount and (issecretvalue and issecretvalue(parserEvent.amount)) then
+		mergeEligible = false
+	end
 	end
 
 	-- Ignore the event if it is unrecognized.
@@ -1786,7 +1828,7 @@ end
 
 -- ****************************************************************************
 -- Forever fallback: the combat log delivers nothing usable there, so
--- damage/heals are derived from UNIT_COMBAT instead, attributed to
+-- damage/heals/misses are derived from UNIT_COMBAT instead, attributed to
 -- whichever spell the player last cast. Stands down per-direction once a
 -- real combat log event for the player has been parsed (see incomingLogSeen/
 -- outgoingLogSeen above), so nothing is ever shown twice.
@@ -1812,31 +1854,72 @@ function eventFrame:UNIT_SPELLCAST_SUCCEEDED(unitID, _, spellID) RecordPlayerSpe
 function eventFrame:UNIT_SPELLCAST_START(unitID, _, spellID) RecordPlayerSpell(unitID, spellID) end
 function eventFrame:UNIT_SPELLCAST_SENT(unitID, _, _, spellID) RecordPlayerSpell(unitID, spellID) end
 
-function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount)
-	local ok, value = pcall(function() return amount + 0 end)
-	if not ok or type(value) ~= "number" or value <= 0 then return end
+-- UNIT_COMBAT actions that map to MSBT miss types. The action doubles as the
+-- missType string the MissHandler and the profile events expect.
+local missActions = {
+MISS = true, DODGE = true, PARRY = true, BLOCK = true,
+RESIST = true, ABSORB = true, IMMUNE = true, REFLECT = true,
+}
 
-	-- Outgoing damage: UNIT_COMBAT on the target, attributed to the last
+function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask)
+	if not action or (issecretvalue and issecretvalue(action)) then return end
+
+	local isWound = (action == "WOUND")
+	local isMiss = missActions[action]
+	if not isWound and not isMiss then return end
+
+	-- Compound flags (e.g. critical + glancing/block variants) require substring
+	-- matching; flagText must be a plain string for pattern work.
+	local isCrit = false
+	if flagText and not (issecretvalue and issecretvalue(flagText)) then
+		isCrit = string_find(flagText, "CRITICAL", 1, true) ~= nil
+	end
+
+	-- Plain-number amounts: skip zero-value wounds. Secret amounts flow through
+	-- untouched; the display pipeline (FormatEvent, thresholds, merging) is
+	-- hardened to handle them safely.
+	if isWound and amount ~= nil and not (issecretvalue and issecretvalue(amount)) and amount <= 0 then return end
+
+	-- Outgoing damage/misses: UNIT_COMBAT on the target, attributed to the last
 	-- spell the player cast. Skipped while the damage meter is delivering.
-	if unitTarget == "target" and action == "WOUND" then
+	if unitTarget == "target" then
 		if outgoingLogSeen or not InCombatLockdown() then return end
 		-- In a group, UNIT_COMBAT also reports party members' damage on the target;
 		-- once the damage meter (player-only) is delivering, rely on it instead.
-		if meterDeliveredThisCombat and IsInGroup() then return end
-		if GetTime() - lastMeterDeltaTime < 1 then return end
+		if isWound and meterDeliveredThisCombat and IsInGroup() then return end
+		if isWound and GetTime() - lastMeterDeltaTime < 1 then return end
+
 		local skillID, skillName
 		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 4 then
 			skillID = lastPlayerSpellID
 			skillName = GetSpellInfo(skillID)
 		end
-		ParserEventsHandler({eventType = "damage", sourceUnit = "player", recipientName = NonSecret(UnitName("target")), amount = value,
-			isCrit = (flagText == "CRITICAL"), skillID = skillID, skillName = skillName})
+
+		local parserEvent = {
+			sourceUnit = "player",
+			recipientName = NonSecret(UnitName("target")),
+			isCrit = isCrit,
+			skillID = skillID,
+			skillName = skillName,
+		}
+		if isWound then
+			parserEvent.eventType = "damage"
+			parserEvent.amount = amount
+			-- schoolMask shares the numeric domain with the old combat log damage
+			-- schools, so it can color the amount directly.
+			if schoolMask and not (issecretvalue and issecretvalue(schoolMask)) then parserEvent.damageType = schoolMask end
+		else
+			parserEvent.eventType = "miss"
+			parserEvent.missType = action
+		end
+		ParserEventsHandler(parserEvent)
 		return
 	end
 
 	if unitTarget ~= "player" or incomingLogSeen then return end
-	if action == "WOUND" then
-		ParserEventsHandler({eventType = "damage", recipientUnit = "player", amount = value, isCrit = (flagText == "CRITICAL")})
+	if isWound then
+		ParserEventsHandler({eventType = "damage", recipientUnit = "player", amount = amount, isCrit = isCrit,
+			damageType = (schoolMask and not (issecretvalue and issecretvalue(schoolMask))) and schoolMask or nil})
 	elseif action == "HEAL" then
 		-- Attribute to the player's own last cast (a self heal) when there is
 		-- one; UNIT_COMBAT doesn't say who healed.
@@ -1848,7 +1931,9 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount)
 			sourceName = playerName
 		end
 		ParserEventsHandler({eventType = "heal", recipientUnit = "player", sourceName = sourceName, recipientName = playerName,
-			amount = value, isCrit = (flagText == "CRITICAL"), skillID = skillID, skillName = skillName})
+			amount = amount, isCrit = isCrit, skillID = skillID, skillName = skillName})
+	elseif isMiss then
+		ParserEventsHandler({eventType = "miss", recipientUnit = "player", missType = action})
 	end
 end
 

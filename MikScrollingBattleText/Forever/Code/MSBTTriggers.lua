@@ -125,6 +125,30 @@ end
 
 
 -- ****************************************************************************
+-- Returns whether or not the player has a named buff.
+-- Forever/Midnight 12.x: the legacy UnitBuff/UnitAura globals are gone; use
+-- the C_UnitAuras API and match by aura name.
+-- ****************************************************************************
+local function IsPlayerBuffActive(buffName)
+	if not buffName or buffName == "" or not C_UnitAuras then
+		return false
+	end
+
+	local i = 1
+	while true do
+		local aura = C_UnitAuras.GetAuraDataByIndex("player", i, "HELPFUL")
+		if not aura then
+			return false
+		end
+		if aura.name == buffName then
+			return true
+		end
+		i = i + 1
+	end
+end
+
+
+-- ****************************************************************************
 -- Creates a map of test functions for supported test types.
 -- ****************************************************************************
 local function CreateTestFuncs()
@@ -226,8 +250,8 @@ local function CreateConditionFuncs()
 	-- Exception conditions.
 	exceptionConditionFuncs = {
 		activeTalents = function (f, t, v) return f(GetActiveSpecGroup(), v) end,
-		buffActive = function (f, t, v) return UnitBuff("player", v) and true or false end,
-		buffInactive = function (f, t, v) return not UnitBuff("player", v) and true or false end,
+		buffActive = function (f, t, v) return IsPlayerBuffActive(v) end,
+		buffInactive = function (f, t, v) return not IsPlayerBuffActive(v) end,
 		currentCP = function (f, t, v) return f(GetComboPoints("player"), v) end,
 		currentPower = function (f, t, v) return f(UnitPower("player"), v) end,
 		inCombat = function (f, t, v) return f(UnitAffectingCombat("player") == true and true or false, v) end,
