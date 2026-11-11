@@ -3,6 +3,32 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] - 2026-11-11
+
+### Restored
+- **The 1.2.x per-spell outgoing engine is back (v1.2.2 state), now properly
+  verified.** The earlier "no damage at all" reports were caused by the addon
+  being *disabled* in the client's addon list (its SavedVariables file was not
+  being written on /reload - that is how it was detected), so the engine had
+  never actually been tested. In-game diagnostics confirmed the
+  `C_DamageMeter` feed delivers fully usable (non-secret) per-spell totals on
+  Forever - with melee under its own spellID (6603) - even with Blizzard's
+  meter toggle off, so the engine is viable.
+- Includes everything from v1.2.2: per-spell attribution (weapon hits render
+  as plain melee numbers), player-only GUID filter + total cross-check (only a
+  provable mismatch skips data), instant direct-hit display (meter delta
+  within 1s of the cast), sustained-damage grouping (`Spell (hits) total`
+  flushed after 3.5s idle or at combat end), and no combat-start baseline
+  clearing.
+
+### Changed
+- The misleading `damageMeterEnabled` warning was removed: the feed is proven
+  to work with the toggle off on Forever.
+- `MikSBT.DebugMeterInfo()` keeps the disk-export enhancement (stores its
+  lines in the `MSBT_DebugDiagnostics` saved variable for
+  `WTF\...\SavedVariables\MikScrollingBattleText.lua`), now including the
+  feed state line (ticker, last activity, pending events, tracked totals).
+
 ## [1.2.3] - 2026-11-11
 
 ### Changed

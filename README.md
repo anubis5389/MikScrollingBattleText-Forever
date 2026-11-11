@@ -75,19 +75,33 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
 - **Hechizos multi-rango de Classic**: cada rango de cada hechizo tiene su propio
   `spellID`; la correlación de casts guarda el ID real del último cast.
 
-### Limitaciones conocidas (por diseño de la API de Forever)
+### Cómo funciona el texto de combate en Forever (v1.2.0)
 
-- **Solo tu daño, una sola vez**: en grupo, el daño/curación salientes provienen
-  exclusivamente del medidor `C_DamageMeter` (solo-jugador; totales por hechizo
-  cada 0.5 s, sin detalle por golpe ni críticos) porque `UNIT_COMBAT` no permite
-  atribuir golpes a un atacante concreto. En solitario, `UNIT_COMBAT` manda
-  (detalle por golpe, críticos, escuelas) y el medidor se retira, evitando
-  duplicados.
-- La **curación saliente** (incluida la autocuración) llega siempre vía el
-  medidor como totales agregados; no hay feed por golpe de curación saliente en
-  Forever.
+- **Daño y curación salientes = solo tuyos, siempre.** La única fuente es el
+  medidor nativo `C_DamageMeter`, filtrado por tu GUID: nunca puede mostrar el
+  daño de otros jugadores, ni duplicar golpes. Verificado en juego: el feed
+  entrega datos incluso con el medidor de Blizzard desactivado en la interfaz.
+- **Cada hechizo es independiente y se agrupa.** Los daños se acumulan por
+  `spellID` y se muestran en una línea cuando el hechizo deja de producir
+  (3.5 s) o al acabar el combate: `Hechizo (golpes) total` - un DoT que hace
+  30 en 10 s se muestra como una sola línea con su número de golpes (estimado
+  por ventanas de sondeo de 0.5 s; la API no expone conteos exactos).
+- **Hechizos instantáneos de golpe único se muestran al momento**: si el daño
+  del medidor llega ≤1 s después de castear ese hechizo, es su golpe directo y
+  se muestra al instante (`Hechizo cantidad`). Solo se agrupan los daños en el
+  tiempo: ticks de DoT/HoT, hechizos canalizados y golpes de arma.
+- **El daño de arma es independiente**: llega bajo su propio ID del medidor y
+  se muestra como número simple (estilo melee clásico), nunca mezclado con el
+  último hechizo casteado.
+- **Entrante**: daño recibido y misses sobre ti vía `UNIT_COMBAT` (con
+  críticos y escuela de daño). En solitario también se muestran tus misses
+  salientes; en grupo no (no se pueden atribuir).
+- **Sin críticos salientes ni escuelas de color en los números salientes**: la
+  API del medidor solo expone totales agregados, sin detalle por golpe.
 - Las curaciones de otros jugadores sobre ti no se muestran (no se pueden
   atribuir a un caster).
+- **Diagnóstico**: `/run MikSBT.DebugMeterInfo()` imprime qué devuelve el
+  medidor en vivo (disponibilidad, fuentes de la sesión, hechizos y totales).
 - Los triggers que dependían de subeventos del combat log (p. ej. detectar el
   hechizo exacto de un proc) no disponen de ese feed; el resto de triggers
   funciona.

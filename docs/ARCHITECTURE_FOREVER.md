@@ -78,43 +78,56 @@ CHAT_MSG_MONSTER_EMOTE ───┘         ▼
 ### 3.1 Fallback Forever en `MSBTMain.lua`
 
 Activado solo si `MikSBT.Client.isForever` (registro de eventos en `Enable()`).
-Cada dirección ("stand-down") se apaga cuando otra fuente entrega el evento
-(`incomingLogSeen` / `outgoingLogSeen` / `unitCombatOutgoingSeen`) — en Forever
-el combat log nunca entrega, por lo que el fallback permanece activo toda la
-sesión.
+La dirección entrante se apaga cuando el combat log real entrega un evento del
+jugador (`incomingLogSeen`) — en Forever nunca ocurre, por lo que el fallback
+permanece activo toda la sesión.
 
-**Separación de autoridad para el daño/curación salientes** (garantiza "solo mi
-daño, nunca duplicado"):
+**Motor saliente v1.2.0 — `C_DamageMeter` como única autoridad** (solitario y
+grupo por igual):
 
-| Contexto | Daño saliente | Misses salientes | Curación saliente |
-|---|---|---|---|
-| **Grupo** (`IsInGroup()`) | `C_DamageMeter` (única autoridad) | no se muestran (inatribuibles) | `C_DamageMeter` |
-| **Solitario** | `UNIT_COMBAT` (por golpe, con críticos/escuela) | `UNIT_COMBAT` | `C_DamageMeter` |
-| Grupo sin API `C_DamageMeter` | `UNIT_COMBAT` (último recurso) | `UNIT_COMBAT` | — |
+| Evento | Fuente | Motivo |
+|---|---|---|
+| Daño saliente | `C_DamageMeter` (GUID del jugador) | `UNIT_COMBAT` no distingue al atacante: mezclaba el daño de compañeros y confundía golpes de arma con el último hechizo casteado |
+| Curación saliente | `C_DamageMeter` | ídem; sin feed por golpe en Forever |
+| Misses salientes | `UNIT_COMBAT(target)`, solo en solitario | en grupo un miss de un compañero sería inatribuible |
+| Daño/misses entrantes | `UNIT_COMBAT(player)` | el receptor sí es atribuible (tú) |
+| Curaciones entrantes de otros | no se muestran | no se puede atribuir el caster |
 
-Razones de diseño:
+Detalles del motor:
 
-- En grupo, `UNIT_COMBAT(target, ...)` no distingue al atacante: cualquier
-  compañero golpeando al mismo target aparecía como daño propio. Por eso el
-  camino de target se retira por completo cuando el medidor está disponible.
-- En solitario, la primera entrega de `UNIT_COMBAT` activa
-  `unitCombatOutgoingSeen`, que hace retirar el poll de daño del medidor
-  (`PollDamageMeter`) — el mismo golpe nunca se muestra dos veces.
-- La bandera se resetea al entrar en combate (`PLAYER_REGEN_DISABLED`) y en
-  `GROUP_ROSTER_UPDATE` (cambio de autoridad limpio al entrar/salir de grupo
-  en mitad de un combate).
-- **Curación**: `UNIT_COMBAT` no emite eventos de curación en absoluto (no se
-  puede atribuir el caster; una curación de otro jugador sobre ti se mostraría
-  como autocuración tuya, y las autocuraciones se duplicarían con el medidor).
-  El medidor cubre toda la sanación hecha, incluidas autocuraciones.
+- **Filtro de identidad**: se consulta por el GUID del jugador y además se
+  exige que la sesión contenga una fuente con `isLocalPlayer` (campo
+  `NeverSecret`); sin esa guarda, nada se muestra.
+- **Disponibilidad**: `C_DamageMeter.IsDamageMeterAvailable()` + CVar
+  `damageMeterEnabled` (el medidor de Blizzard debe estar activo; si no lo
+  está, se avisa una vez por sesión por chat y no se muestra texto saliente —
+  mejor silencio que datos atribuidos incorrectamente).
+- **Clave por `spellID`** (nunca por nombre): cada hechizo acumula
+  independientemente; los golpes de arma llegan bajo su propio ID y se
+  muestran como número simple (sin nombre → estilo melee clásico de MSBT).
+- **Agrupación con estimación de golpes**: cada hechizo acumula mientras
+  produce y se muestra al quedar silencioso 3.5 s (`METER_IDLE_FLUSH_TIME`,
+  debe superar el intervalo de tick de DoTs máx. 3 s) o al salir de combate:
+  `Hechizo (N) total`. N = ventanas de sondeo de 0.5 s con crecimiento —
+  la API no expone conteos de golpe exactos.
+- **Golpes directos instantáneos**: un delta que llega ≤1 s tras el cast del
+  jugador (`recentPlayerCasts` vía `UNIT_SPELLCAST_SUCCEEDED`) es el golpe
+  directo del hechizo y se muestra al momento (`Hechizo cantidad`), sin pasar
+  por la agrupación. Los canales se marcan como sostenidos durante toda su
+  duración (`UNIT_SPELLCAST_CHANNEL_START/STOP` → `channelledSpells`), y los
+  ticks y golpes de arma (sin cast) siempre se agrupan. Los casts recientes
+  sobreviven al reset de inicio de combate: el hechizo que inicia un combate
+  suele castearse justo antes de `PLAYER_REGEN_DISABLED`.
+- **Baseline de totales**: `damageMeterLastTotals` nunca se borra al entrar en
+  combate; el guard `delta < 0 → delta = totalAmount` cubre los resets de
+  sesión/pull sin reemitir totales históricos.
+- **Secret Values**: `SafeAddZero` (pcall `value + 0`) desenvuelve/descarta
+  valores secretos en esta vía.
+- **Diagnóstico**: `/run MikSBT.DebugMeterInfo()` imprime disponibilidad,
+  fuentes de la sesión y hechizos del lookup por GUID.
 
-- **Outgoing (target, solitario):** `UNIT_COMBAT(target, WOUND|MISS...)` →
-  atribuido al último cast del jugador (`lastPlayerSpellID`, ventana de 4 s).
 - **Incoming (player):** `WOUND` → daño con crítico por substring y escuela vía
   `schoolMask`; `MISS`/`DODGE`/... → evento miss.
-- **Medidor:** `C_DamageMeter.GetCombatSessionSourceFromType` polled cada 0.5 s
-  en combate; convierte deltas de totales por hechizo en eventos sintéticos.
-  `SafeAddZero` (pcall `value + 0`) detecta y descarta valores secretos en esa vía.
 
 ### 3.2 Secret Values — puntos de control
 
