@@ -3,23 +3,6 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.2.2] - 2026-11-11
-
-### Fixed
-- **No outgoing damage displayed at all (regression in 1.2.0).** The new
-  safety checks added in 1.2.0 silently blocked the entire meter feed on some
-  setups: the `damageMeterEnabled`/`IsDamageMeterAvailable()` gate and the
-  `isLocalPlayer` session guard both failed closed. They are now warnings
-  only (fail-open) - the feed is always attempted, and attribution is instead
-  cross-checked by comparing the GUID-keyed source total against the
-  session's local-player total; only a provable mismatch (both values plain
-  and comparable) skips the data, with a one-time chat warning.
-
-### Changed
-- `MikSBT.DebugMeterInfo()` now also prints the feed state (ticker running,
-  seconds since the last meter activity, pending events, tracked totals) to
-  distinguish a dead feed from a blocked one.
-
 ## [1.2.1] - 2026-11-11
 
 ### Changed
