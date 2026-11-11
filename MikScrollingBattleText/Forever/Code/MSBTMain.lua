@@ -1750,6 +1750,16 @@ local DM_HEALINGDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.H
 local METER_IDLE_FLUSH_TIME = 3.5
 local pendingMeterEvents = {}
 
+-- Direct-hit discrimination: when a meter delta for a spell arrives within
+-- DIRECT_HIT_WINDOW seconds of the player casting that spell, it is the
+-- spell's direct hit and is displayed immediately instead of being grouped.
+-- Deltas that arrive later are DoT/HoT ticks and keep accumulating; weapon
+-- hits (no cast at all) also keep accumulating. Channels are always treated
+-- as sustained damage (see UNIT_SPELLCAST_CHANNEL_START below).
+local DIRECT_HIT_WINDOW = 1.0
+local recentPlayerCasts = {}
+local channelledSpells = {}
+
 -- Resolves a spellID to its name, preferring the modern C_Spell API. A nil
 -- result means the meter entry has no spell name (weapon/melee hits), which
 -- MSBT then renders as the classic plain melee number.
@@ -1809,14 +1819,37 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 			damageMeterLastTotals[key] = totalAmount
 
 			if delta > 0 then
+				local now = GetTime()
 				local pending = pendingMeterEvents[key]
-				if not pending then
-					pending = { eventType = eventType, spellID = spellID, amount = 0, hitWindows = 0 }
-					pendingMeterEvents[key] = pending
+
+				-- A delta arriving right after the player cast this spell is
+				-- its direct hit: show it immediately (single-hit instant
+				-- spells must not wait for the grouping window). Ticks (no
+				-- recent cast), channels, and already-accumulating spells are
+				-- sustained damage and keep being grouped; weapon hits (no
+				-- cast) also group.
+				local isDirectHit = pending == nil
+					and not channelledSpells[spellID]
+					and recentPlayerCasts[spellID]
+					and (now - recentPlayerCasts[spellID]) <= DIRECT_HIT_WINDOW
+
+				if isDirectHit then
+					local spellName = ResolveMeterSpellName(spellID)
+					local parserEvent = { eventType = eventType, sourceUnit = "player", amount = delta }
+					if spellName then
+						parserEvent.skillID = spellID
+						parserEvent.skillName = spellName
+					end
+					ParserEventsHandler(parserEvent)
+				else
+					if not pending then
+						pending = { eventType = eventType, spellID = spellID, amount = 0, hitWindows = 0 }
+						pendingMeterEvents[key] = pending
+					end
+					pending.amount = pending.amount + delta
+					pending.hitWindows = pending.hitWindows + 1
+					pending.lastIncrease = now
 				end
-				pending.amount = pending.amount + delta
-				pending.hitWindows = pending.hitWindows + 1
-				pending.lastIncrease = GetTime()
 			end
 		end
 	end
@@ -1926,7 +1959,12 @@ local function StartDamageMeterFallback()
 	-- the "delta < 0" handling in PollDamageMeterSource keeps deltas correct.
 	-- Clearing them here would re-emit the whole accumulated total as one
 	-- giant number at the start of every fight.
+	--
+	-- recentPlayerCasts is NOT cleared either: the spell that *starts* a fight
+	-- is often cast right before combat begins, and stale entries can't cause
+	-- false direct-hits (they only match within DIRECT_HIT_WINDOW seconds).
 	EraseTable(pendingMeterEvents)
+	EraseTable(channelledSpells)
 	damageMeterTicker = C_Timer.NewTicker(0.5, PollDamageMeter)
 end
 
@@ -1998,6 +2036,28 @@ local missActions = {
 MISS = true, DODGE = true, PARRY = true, BLOCK = true,
 RESIST = true, ABSORB = true, IMMUNE = true, REFLECT = true,
 }
+
+-- Records the player's own casts so the meter feed can tell a spell's direct
+-- hit (delta right after the cast) from its periodic ticks (see
+-- DIRECT_HIT_WINDOW). Channelled spells are flagged as sustained damage for
+-- their whole duration.
+function eventFrame:UNIT_SPELLCAST_SUCCEEDED(unitID, _, spellID)
+	if unitID ~= "player" then return end
+	local ok, id = pcall(function() return spellID + 0 end)
+	if ok and type(id) == "number" then recentPlayerCasts[id] = GetTime() end
+end
+
+function eventFrame:UNIT_SPELLCAST_CHANNEL_START(unitID, _, spellID)
+	if unitID ~= "player" then return end
+	local ok, id = pcall(function() return spellID + 0 end)
+	if ok and type(id) == "number" then channelledSpells[id] = true end
+end
+
+function eventFrame:UNIT_SPELLCAST_CHANNEL_STOP(unitID, _, spellID)
+	if unitID ~= "player" then return end
+	local ok, id = pcall(function() return spellID + 0 end)
+	if ok and type(id) == "number" then channelledSpells[id] = nil end
+end
 
 function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask)
 	if not action or (issecretvalue and issecretvalue(action)) then return end
@@ -2075,6 +2135,9 @@ local function Enable()
 	eventFrame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
 	if MikSBT.Client.isForever then
 		eventFrame:RegisterEvent("UNIT_COMBAT")
+		eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+		eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
+		eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
 	end
 
 	-- Register the parser events handler.

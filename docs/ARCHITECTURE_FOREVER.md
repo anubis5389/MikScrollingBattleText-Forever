@@ -110,6 +110,14 @@ Detalles del motor:
   debe superar el intervalo de tick de DoTs máx. 3 s) o al salir de combate:
   `Hechizo (N) total`. N = ventanas de sondeo de 0.5 s con crecimiento —
   la API no expone conteos de golpe exactos.
+- **Golpes directos instantáneos**: un delta que llega ≤1 s tras el cast del
+  jugador (`recentPlayerCasts` vía `UNIT_SPELLCAST_SUCCEEDED`) es el golpe
+  directo del hechizo y se muestra al momento (`Hechizo cantidad`), sin pasar
+  por la agrupación. Los canales se marcan como sostenidos durante toda su
+  duración (`UNIT_SPELLCAST_CHANNEL_START/STOP` → `channelledSpells`), y los
+  ticks y golpes de arma (sin cast) siempre se agrupan. Los casts recientes
+  sobreviven al reset de inicio de combate: el hechizo que inicia un combate
+  suele castearse justo antes de `PLAYER_REGEN_DISABLED`.
 - **Baseline de totales**: `damageMeterLastTotals` nunca se borra al entrar en
   combate; el guard `delta < 0 → delta = totalAmount` cubre los resets de
   sesión/pull sin reemitir totales históricos.
