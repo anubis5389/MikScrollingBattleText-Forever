@@ -3,6 +3,31 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.0] - 2026-11-11
+
+### Fixed
+- **Outgoing damage displayed nothing again (v1.3.0).** The attribution
+  cross-check compared the session total and the GUID-keyed source total taken
+  from two API calls at different moments - during active combat the totals
+  grow in between, so the check produced false mismatches and silently skipped
+  poll after poll. Removed: attribution is guaranteed by the GUID-keyed
+  lookup alone (in-game diagnostics already proved it returns exactly the
+  local player's spells). The poll is now also wrapped in a pcall with a
+  one-time chat warning, so a broken poll can never again fail silently.
+- **Outgoing heals never displayed.** The synthetic heal events lacked
+  `sourceName`/`recipientName`, and HealHandler's self-heal check
+  (`sourceName == recipientName`) misfired on `nil == nil`, reclassifying them
+  as `SELF_HEAL` events. The meter feed now sets `sourceName`, so heals
+  display as `OUTGOING_HEAL` (the meter cannot tell who received the heal, so
+  everything stays outgoing).
+
+### Added
+- **Overheal display for outgoing heals**: the meter exposes the healing done
+  above the target's max health as `overkillAmount` on HealingDone entries;
+  it is now accumulated per spell and passed as `overhealAmount`, which MSBT's
+  FormatEvent already renders as the `<overheal>` trailer (profile option
+  `overheal`, enabled by default).
+
 ## [1.3.0] - 2026-11-11
 
 ### Restored

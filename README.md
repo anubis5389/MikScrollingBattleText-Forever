@@ -90,6 +90,11 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
   del medidor llega ≤1 s después de castear ese hechizo, es su golpe directo y
   se muestra al instante (`Hechizo cantidad`). Solo se agrupan los daños en el
   tiempo: ticks de DoT/HoT, hechizos canalizados y golpes de arma.
+- **Curación saliente y sobre-sanación (overheal)**: tus curaciones se muestran
+  como `Hechizo cantidad`, y si sanaste por encima de la vida máxima, el exceso
+  aparece como trailer `<exceso>` (opción *Overheal* de MSBT, activada por
+  defecto) - el medidor expone la sobre-sanación por hechizo en
+  `overkillAmount`. Los HoT se agrupan como `Hechizo (golpes) total`.
 - **El daño de arma es independiente**: llega bajo su propio ID del medidor y
   se muestra como número simple (estilo melee clásico), nunca mezclado con el
   último hechizo casteado.

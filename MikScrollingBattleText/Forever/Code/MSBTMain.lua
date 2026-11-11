@@ -1728,9 +1728,13 @@ local function SafeText(value)
 end
 
 local damageMeterLastTotals = {}
+-- Parallel to damageMeterLastTotals, per healing spell: the meter's
+-- overkillAmount (in HealingDone entries this is the overheal - healing done
+-- above the target's max health), accumulated alongside the amount so
+-- FormatEvent can render the overheal trailer.
+local damageMeterLastOverkills = {}
 local damageMeterTicker
 local meterWarnedThisSession = false
-local meterMismatchWarned = false
 -- GetTime() of the last poll that saw a growing spell total; the diagnostics
 -- (/run MikSBT.DebugMeterInfo()) use it to tell a dead feed from a blocked one.
 local meterLastActivity = nil
@@ -1794,38 +1798,17 @@ end
 local function PollDamageMeterSource(damageMeterType, eventType)
 	local okGUID, playerGUID = pcall(UnitGUID, "player")
 	if not okGUID or not playerGUID then return end
+	local playerName = UnitName("player")
 
-	-- Attribution cross-check: read the session's local player total (isLocalPlayer
-	-- is NeverSecret) and compare it against the GUID-keyed source's total when
-	-- both can be unwrapped. Only a PROVABLE mismatch (both values plain and the
-	-- comparison succeeding) blocks this poll - a missing session, a secret value,
-	-- or an error all fail open, because silently blocking would leave the addon
-	-- showing nothing (that regression shipped in 1.2.0 and had to be reverted).
-	local sessionLocalTotal
-	local okSession, session = pcall(C_DamageMeter.GetCombatSessionFromType, 0, damageMeterType)
-	if okSession and session and session.combatSources then
-		for _, combatSource in ipairs(session.combatSources) do
-			if combatSource.isLocalPlayer then
-				sessionLocalTotal = SafeAddZero(combatSource.totalAmount)
-				break
-			end
-		end
-	end
-
+	-- Attribution is guaranteed by the GUID-keyed source lookup alone:
+	-- GetCombatSessionSourceFromType(0, type, playerGUID) returns exactly the
+	-- local player's spells (verified in game: 13 spells, all the Shaman's own
+	-- abilities, none from other players). A previous session-total
+	-- cross-check was removed - it compared two API calls taken at different
+	-- moments, so active combat routinely produced false mismatches that
+	-- silently dropped the whole poll (nothing displayed at all).
 	local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, damageMeterType, playerGUID)
 	if not okSource or not source then return end
-
-	local sourceTotal = SafeAddZero(source.totalAmount)
-	if sourceTotal ~= nil and sessionLocalTotal ~= nil then
-		local okCompare, isEqual = pcall(function() return sourceTotal == sessionLocalTotal end)
-		if okCompare and isEqual == false then
-			if not meterMismatchWarned then
-				meterMismatchWarned = true
-				print("|cffff7d0aMSBT:|r damage meter source lookup does not match the session's local player - data skipped for safety (run /run MikSBT.DebugMeterInfo())")
-			end
-			return
-		end
-	end
 
 	local okSpells, combatSpells = pcall(function() return source.combatSpells end)
 	if not okSpells or type(combatSpells) ~= "table" then return end
@@ -1846,6 +1829,20 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 			if delta < 0 then delta = totalAmount end
 			damageMeterLastTotals[key] = totalAmount
 
+			-- Overheal delta for healing spells (the meter's overkillAmount
+			-- field on HealingDone entries). Accumulated per spell next to
+			-- the amount, with the same session-reset handling.
+			local overhealDelta
+			if eventType == "heal" then
+				local overkillAmount = SafeAddZero(entry.overkillAmount)
+				if overkillAmount then
+					local previousOverkill = damageMeterLastOverkills[key] or 0
+					overhealDelta = overkillAmount - previousOverkill
+					if overhealDelta < 0 then overhealDelta = overkillAmount end
+					damageMeterLastOverkills[key] = overkillAmount
+				end
+			end
+
 			if delta > 0 then
 				local now = GetTime()
 				meterLastActivity = now
@@ -1864,10 +1861,17 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 
 				if isDirectHit then
 					local spellName = ResolveMeterSpellName(spellID)
-					local parserEvent = { eventType = eventType, sourceUnit = "player", amount = delta }
+					-- sourceName is set so HealHandler's self-heal check
+					-- (sourceName == recipientName) cannot misfire on the
+					-- synthetic event's nil fields: the meter cannot tell
+					-- who received the heal, so everything stays OUTGOING.
+					local parserEvent = { eventType = eventType, sourceUnit = "player", sourceName = playerName, amount = delta }
 					if spellName then
 						parserEvent.skillID = spellID
 						parserEvent.skillName = spellName
+					end
+					if eventType == "heal" and overhealDelta and overhealDelta > 0 then
+						parserEvent.overhealAmount = overhealDelta
 					end
 					ParserEventsHandler(parserEvent)
 				else
@@ -1876,6 +1880,9 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 						pendingMeterEvents[key] = pending
 					end
 					pending.amount = pending.amount + delta
+					if eventType == "heal" and overhealDelta and overhealDelta > 0 then
+						pending.overhealAmount = (pending.overhealAmount or 0) + overhealDelta
+					end
 					pending.hitWindows = pending.hitWindows + 1
 					pending.lastIncrease = now
 				end
@@ -1897,13 +1904,22 @@ local function FlushPendingMeterEvent(key)
 	if pending.amount <= 0 then return end
 
 	local spellName = ResolveMeterSpellName(pending.spellID)
-	local parserEvent = { eventType = pending.eventType, sourceUnit = "player", amount = pending.amount }
+	-- sourceName set for the same reason as in PollDamageMeterSource: keeps
+	-- grouped heals OUTGOING instead of misclassified as self-heals.
+	local parserEvent = { eventType = pending.eventType, sourceUnit = "player", sourceName = UnitName("player"), amount = pending.amount }
 	if spellName then
 		parserEvent.skillID = pending.spellID
 		parserEvent.skillName = spellName .. " (" .. pending.hitWindows .. ")"
 	end
+	if pending.eventType == "heal" and pending.overhealAmount then
+		parserEvent.overhealAmount = pending.overhealAmount
+	end
 	ParserEventsHandler(parserEvent)
 end
+
+-- One-time warning if the poll itself errors (e.g. an unexpected secret-value
+-- arithmetic path) - without it a broken ticker would silently display nothing.
+local meterPollErrorWarned = false
 
 -- ****************************************************************************
 -- Polls both damage and healing done by the player, then flushes every spell
@@ -1913,8 +1929,12 @@ local function PollDamageMeter()
 	-- The availability/CVar checks are warnings only (see WarnMeterStateOnce):
 	-- polling unconditionally avoids silently dead feeds when a check can't be
 	-- confirmed on this client.
-	PollDamageMeterSource(DM_DAMAGEDONE, "damage")
-	PollDamageMeterSource(DM_HEALINGDONE, "heal")
+	local okDamage, damageError = pcall(PollDamageMeterSource, DM_DAMAGEDONE, "damage")
+	local okHeal, healError = pcall(PollDamageMeterSource, DM_HEALINGDONE, "heal")
+	if (not okDamage or not okHeal) and not meterPollErrorWarned then
+		meterPollErrorWarned = true
+		print("|cffff7d0aMSBT:|r damage meter poll error: " .. SafeText(not okDamage and damageError or healError) .. " (run /run MikSBT.DebugMeterInfo())")
+	end
 
 	local now = GetTime()
 	for key, pending in pairs(pendingMeterEvents) do
