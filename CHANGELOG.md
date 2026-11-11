@@ -3,6 +3,23 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.3] - 2026-11-11
+
+### Changed
+- **REVERTED the entire 1.2.x outgoing engine** (per-spell meter-only
+  attribution, instant direct-hit display, safety guards). Outgoing damage
+  displayed nothing since 1.2.0; behavior is back to the 1.1.2 engine
+  (`UNIT_COMBAT` cast-correlation + `C_DamageMeter` feed), which displayed
+  damage. The known 1.1.x issues return with it: party members' damage on the
+  same target can show as yours, and sustained damage may appear fragmented.
+
+### Kept
+- `MikSBT.DebugMeterInfo()` (`/run MikSBT.DebugMeterInfo()`) - prints whether
+  the meter API is available, whether the session tracks the local player,
+  and whether per-spell totals come back as usable numbers or `<secret>`
+  values. This determines whether a meter-only engine can work on Forever at
+  all, and was kept from the 1.2.x line for that purpose.
+
 ## [1.1.2] - 2026-11-10
 
 ### Fixed

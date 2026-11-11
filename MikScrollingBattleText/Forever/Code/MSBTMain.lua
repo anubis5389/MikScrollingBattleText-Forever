@@ -1818,6 +1818,60 @@ local function PollDamageMeter()
 end
 
 -- ****************************************************************************
+-- Diagnostic: /run MikSBT.DebugMeterInfo()
+-- Prints what C_DamageMeter currently returns so it can be verified whether
+-- the meter feed actually delivers usable (non-secret) data on this client:
+-- availability, session sources with the local player flag, and the per-spell
+-- entries the GUID-keyed source lookup reports (amounts or <secret> markers).
+-- ****************************************************************************
+local function SafeDebugText(value)
+	if value == nil then return "nil" end
+	if issecretvalue and issecretvalue(value) then return "<secret>" end
+	local ok, text = pcall(tostring, value)
+	return ok and text or "<unprintable>"
+end
+
+function MikSBT.DebugMeterInfo()
+	if not C_DamageMeter then print("MSBT meter: C_DamageMeter API not present on this client") return end
+
+	local okAvailable, isAvailable, failureReason = pcall(C_DamageMeter.IsDamageMeterAvailable)
+	print("MSBT meter: IsDamageMeterAvailable=" .. SafeDebugText(isAvailable) .. " reason=" .. SafeDebugText(failureReason))
+	local okEnabled, enabled = pcall(function() return GetCVarBool("damageMeterEnabled") end)
+	print("MSBT meter: damageMeterEnabled=" .. (okEnabled and SafeDebugText(enabled) or "unknown"))
+
+	local damageMeterType = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.DamageDone) or 0
+	local healingMeterType = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.HealingDone) or 2
+
+	for _, meterType in ipairs({ { damageMeterType, "DamageDone" }, { healingMeterType, "HealingDone" } }) do
+		local okSession, session = pcall(C_DamageMeter.GetCombatSessionFromType, 0, meterType[1])
+		if not okSession or not session or type(session.combatSources) ~= "table" then
+			print("MSBT meter [" .. meterType[2] .. "]: no session data (call error=" .. tostring(not okSession) .. ")")
+		else
+			local localPlayerFound = false
+			for _, combatSource in ipairs(session.combatSources) do
+				if combatSource.isLocalPlayer then localPlayerFound = true break end
+			end
+			print("MSBT meter [" .. meterType[2] .. "]: sources=" .. #session.combatSources .. " localPlayerInSession=" .. tostring(localPlayerFound))
+
+			local okGUID, playerGUID = pcall(UnitGUID, "player")
+			local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, meterType[1], playerGUID)
+			if not okSource or not source or type(source.combatSpells) ~= "table" then
+				print("MSBT meter [" .. meterType[2] .. "]: GUID source lookup failed or empty")
+			else
+				print("MSBT meter [" .. meterType[2] .. "]: GUID source spells=" .. #source.combatSpells)
+				for i, spell in ipairs(source.combatSpells) do
+					if i > 10 then print("  ...") break end
+					local spellID = SafeAddZero(spell.spellID)
+					local spellName
+					if spellID then spellName = GetSpellInfo(spellID) end
+					print("  spellID=" .. SafeDebugText(spellID) .. " name=" .. SafeDebugText(spellName) .. " total=" .. SafeDebugText(SafeAddZero(spell.totalAmount)))
+				end
+			end
+		end
+	end
+end
+
+-- ****************************************************************************
 -- Starts polling while in combat, if combat log access is blocked or on the
 -- Forever client (whose combat log delivers no usable outgoing events at
 -- all, gate or no gate). Stands down once PollDamageMeter sees a real one.
