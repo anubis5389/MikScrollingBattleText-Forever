@@ -3,41 +3,6 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.2.0] - 2026-11-11
-
-### Changed
-- **Outgoing combat text engine rewritten around strict per-spell attribution.**
-  The `C_DamageMeter` feed (keyed to the player's own GUID) is now the *sole*
-  source for outgoing damage and healing, both solo and in groups. The
-  `UNIT_COMBAT` outgoing path was removed entirely: it cannot tell *who* dealt
-  a hit, so it misattributed party members' damage (any class, same spells or
-  weapon hits) as the player's own, and its cast-correlation heuristic lumped
-  melee swings and DoT ticks together under whichever spell was cast last.
-
-### Fixed
-- **Each spell's damage is now independent.** Meter deltas key strictly by
-  `spellID`; weapon hits (which the meter reports under their own ID) render
-  as the classic plain melee number instead of being folded into the last cast
-  spell.
-- **Only the player's own damage/healing is shown.** The feed is filtered by
-  the player's GUID and additionally requires the local player to be present
-  in the meter session (`isLocalPlayer`) before anything is displayed.
-- **Spells are grouped with a hit estimate.** Each spell accumulates while it
-  keeps producing damage and is displayed as one line when it goes quiet
-  (3.5s) or when combat ends: `<Spell> (<hits>) <total>` - e.g. a DoT that
-  deals 30 damage over 10 seconds shows as one line with its hit count
-  (estimated as one hit per 0.5s poll window in which the total grew).
-- **Combat-start garbage number fixed.** The meter totals baseline is no
-  longer cleared when combat starts; previously that could re-emit the whole
-  accumulated session total as one giant number.
-
-### Added
-- `MikSBT.DebugMeterInfo()` - run `/run MikSBT.DebugMeterInfo()` in game to
-  print live diagnostics of what the meter API returns (availability, session
-  sources, per-spell totals) to diagnose attribution issues.
-- A one-time chat hint if Blizzard's Damage Meter tracking is disabled
-  (`damageMeterEnabled`), since the outgoing text feed requires it.
-
 ## [1.1.2] - 2026-11-10
 
 ### Fixed
