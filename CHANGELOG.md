@@ -3,20 +3,6 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.2.1] - 2026-11-11
-
-### Changed
-- **Instant, single-hit spells now display immediately when cast.** A meter
-  delta arriving within 1s of the player casting that spell is recognized as
-  its direct hit and shown right away (`Spell amount`), instead of waiting for
-  the grouping window. Only sustained damage keeps grouping into
-  `Spell (hits) total`: DoT/HoT ticks (deltas arriving long after the cast),
-  channelled spells (marked as sustained for their whole duration via
-  `UNIT_SPELLCAST_CHANNEL_START/STOP`), and weapon hits (no cast at all).
-- The cast that starts a fight is not forgotten: recent casts survive the
-  combat-start reset (stale entries can't cause false direct-hits since they
-  only match within the 1s window).
-
 ## [1.2.0] - 2026-11-11
 
 ### Changed

@@ -83,13 +83,9 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
   activo (si lo desactivaste, el addon avisa una vez: `/console damageMeterEnabled 1`).
 - **Cada hechizo es independiente y se agrupa.** Los daños se acumulan por
   `spellID` y se muestran en una línea cuando el hechizo deja de producir
-  (3.5 s) o al acabar el combate: `Hechizo (golpes) total` - un DoT que hace
+  (3.5 s) o al acabar el combate: `Hechizo (golpes) total` — un DoT que hace
   30 en 10 s se muestra como una sola línea con su número de golpes (estimado
   por ventanas de sondeo de 0.5 s; la API no expone conteos exactos).
-- **Hechizos instantáneos de golpe único se muestran al momento**: si el daño
-  del medidor llega ≤1 s después de castear ese hechizo, es su golpe directo y
-  se muestra al instante (`Hechizo cantidad`). Solo se agrupan los daños en el
-  tiempo: ticks de DoT/HoT, hechizos canalizados y golpes de arma.
 - **El daño de arma es independiente**: llega bajo su propio ID del medidor y
   se muestra como número simple (estilo melee clásico), nunca mezclado con el
   último hechizo casteado.
