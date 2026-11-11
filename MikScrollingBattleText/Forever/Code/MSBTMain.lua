@@ -46,6 +46,8 @@ local triggerSuppressions = MSBTTriggers.triggerSuppressions
 local powerTypes = MSBTTriggers.powerTypes
 local classMap = MSBTParser.classMap
 
+local IsRetail = WOW_PROJECT_ID == WOW_PROJECT_MAINLINE
+
 
 -------------------------------------------------------------------------------
 -- Constants.
@@ -136,8 +138,12 @@ local combatEventCache = {}
 local eventHandlers = {}
 
 -- Set once a real combat log event involving the player has been parsed, so
--- the Forever-only UNIT_COMBAT incoming fallback stands down.
+-- the Forever-only UNIT_COMBAT / damage meter fallbacks stand down.
 local incomingLogSeen, outgoingLogSeen = false, false
+local lastPlayerSpellID, lastPlayerSpellTime = nil, 0
+-- Forever: set when UNIT_COMBAT delivers an outgoing hit (solo); makes the
+-- C_DamageMeter fallback stand down so the same hit is never shown twice.
+local unitCombatOutgoingSeen = false
 local damageTypeMap = {}
 local damageColorProfileEntries = {}
 local powerTokens = {}
@@ -1710,103 +1716,30 @@ local function SafeAddZero(value)
 	return nil
 end
 
--- Availability is now existence-only: the CVar/IsDamageMeterAvailable checks
--- turned out to silently block the whole outgoing feed on some setups (no
--- damage displayed at all). They run as one-time warnings instead - the feed
--- is attempted regardless, and the session cross-check below guards
--- attribution.
 local function damageMeterAvailable()
-	return C_DamageMeter and true or false
+	return IsRetail and C_DamageMeter and Enum and Enum.DamageMeterType and true or false
 end
-
--- Renders any value as printable text without touching secret values.
-local function SafeText(value)
-	if value == nil then return "nil" end
-	if issecretvalue and issecretvalue(value) then return "<secret>" end
-	local ok, text = pcall(tostring, value)
-	return ok and text or "<unprintable>"
-end
-
 local damageMeterLastTotals = {}
--- Parallel to damageMeterLastTotals, per healing spell: the meter's
--- overkillAmount (in HealingDone entries this is the overheal - healing done
--- above the target's max health), accumulated alongside the amount so
--- FormatEvent can render the overheal trailer.
-local damageMeterLastOverkills = {}
 local damageMeterTicker
-local meterWarnedThisSession = false
--- GetTime() of the last poll that saw a growing spell total; the diagnostics
--- (/run MikSBT.DebugMeterInfo()) use it to tell a dead feed from a blocked one.
-local meterLastActivity = nil
 
-local function WarnMeterStateOnce()
-	if meterWarnedThisSession then return end
-	meterWarnedThisSession = true
-
-	-- Note: the damageMeterEnabled CVar is deliberately NOT warned about -
-	-- in-game diagnostics on Forever confirmed the feed delivers usable data
-	-- even with the toggle off. Only a hard API unavailability is reported.
-
-	local okAvailable, isAvailable, failureReason = pcall(C_DamageMeter.IsDamageMeterAvailable)
-	if okAvailable and isAvailable == false then
-		print("|cffff7d0aMSBT:|r Damage Meter API reports unavailable (reason: " .. SafeText(failureReason) .. ") - attempting to read the feed anyway")
-	end
-end
-
--- Numeric meter type values (in-game-verified constants for the Midnight
--- engine; Enum.DamageMeterType is used only when present, as a sanity check).
-local DM_DAMAGEDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.DamageDone) or 0
-local DM_HEALINGDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.HealingDone) or 2
-
--- Meter deltas are accumulated PER SPELL ID (never merged across different
--- spells) and flushed after the spell goes quiet for METER_IDLE_FLUSH_TIME
--- seconds (or when combat ends). A ticking DoT never goes quiet, so its whole
--- duration ends up as one line: "<Spell> (<hits>) <total>". The hit count is
--- an estimate: one hit per 0.5s poll window in which the spell's total grew
--- (a window rarely contains two hits of the same spell). The value must stay
--- above the longest DoT tick interval (3s in Classic) or ticking spells would
--- flush every tick.
-local METER_IDLE_FLUSH_TIME = 3.5
+-- Meter deltas are aggregated per spell name and flushed every
+-- METER_FLUSH_INTERVAL seconds instead of being emitted raw every 0.5s poll.
+-- Emitting per-poll deltas read as the damage being split into many small
+-- pieces (and MSBT's merge window, MERGE_DELAY_TIME = 0.3s, could never
+-- coalesce events arriving 0.5s apart). Keying by spell name also coalesces
+-- the per-rank entries Classic can produce for the same spell.
+local METER_FLUSH_INTERVAL = 1.0
 local pendingMeterEvents = {}
-
--- Direct-hit discrimination: when a meter delta for a spell arrives within
--- DIRECT_HIT_WINDOW seconds of the player casting that spell, it is the
--- spell's direct hit and is displayed immediately instead of being grouped.
--- Deltas that arrive later are DoT/HoT ticks and keep accumulating; weapon
--- hits (no cast at all) also keep accumulating. Channels are always treated
--- as sustained damage (see UNIT_SPELLCAST_CHANNEL_START below).
-local DIRECT_HIT_WINDOW = 1.0
-local recentPlayerCasts = {}
-local channelledSpells = {}
-
--- Resolves a spellID to its name, preferring the modern C_Spell API. A nil
--- result means the meter entry has no spell name (weapon/melee hits), which
--- MSBT then renders as the classic plain melee number.
-local function ResolveMeterSpellName(spellID)
-	local okModern, name = pcall(C_Spell.GetSpellName, spellID)
-	if okModern and type(name) == "string" and name ~= "" then return name end
-	local okLegacy, legacyName = pcall(GetSpellInfo, spellID)
-	if okLegacy and type(legacyName) == "string" and legacyName ~= "" then return legacyName end
-	return nil
-end
+local lastMeterFlushTime = 0
 
 -- ****************************************************************************
--- Polls one C_DamageMeter type (damage or healing) for the player and
--- accumulates any newly-registered amount per spell into pendingMeterEvents
--- (see FlushPendingMeterEvent for when those are displayed).
+-- Polls one C_DamageMeter type (damage or healing) for the player and turns
+-- any newly-accumulated amount per spell into a synthetic outgoing event.
 -- ****************************************************************************
 local function PollDamageMeterSource(damageMeterType, eventType)
 	local okGUID, playerGUID = pcall(UnitGUID, "player")
 	if not okGUID or not playerGUID then return end
-	local playerName = UnitName("player")
 
-	-- Attribution is guaranteed by the GUID-keyed source lookup alone:
-	-- GetCombatSessionSourceFromType(0, type, playerGUID) returns exactly the
-	-- local player's spells (verified in game: 13 spells, all the Shaman's own
-	-- abilities, none from other players). A previous session-total
-	-- cross-check was removed - it compared two API calls taken at different
-	-- moments, so active combat routinely produced false mismatches that
-	-- silently dropped the whole poll (nothing displayed at all).
 	local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, damageMeterType, playerGUID)
 	if not okSource or not source then return end
 
@@ -1817,140 +1750,152 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 		local spellID = SafeAddZero(entry.spellID)
 		local totalAmount = SafeAddZero(entry.totalAmount)
 		if spellID and totalAmount and totalAmount > 0 then
-			-- Key strictly by spellID: each spell (and weapon hits, which the
-			-- meter reports under their own ID) accumulates independently.
-			local key = eventType .. ":" .. spellID
+			local key = damageMeterType .. ":" .. spellID
 			local previousAmount = damageMeterLastTotals[key] or 0
 
 			-- A drop below the last known total means the session reset
-			-- (new pull/segment or meter reset); treat the fresh total as
-			-- the delta instead of going negative.
+			-- (new pull/segment); treat the fresh total as the delta
+			-- instead of going negative.
 			local delta = totalAmount - previousAmount
 			if delta < 0 then delta = totalAmount end
 			damageMeterLastTotals[key] = totalAmount
 
-			-- Overheal delta for healing spells (the meter's overkillAmount
-			-- field on HealingDone entries). Accumulated per spell next to
-			-- the amount, with the same session-reset handling.
-			local overhealDelta
-			if eventType == "heal" then
-				local overkillAmount = SafeAddZero(entry.overkillAmount)
-				if overkillAmount then
-					local previousOverkill = damageMeterLastOverkills[key] or 0
-					overhealDelta = overkillAmount - previousOverkill
-					if overhealDelta < 0 then overhealDelta = overkillAmount end
-					damageMeterLastOverkills[key] = overkillAmount
-				end
-			end
-
 			if delta > 0 then
-				local now = GetTime()
-				meterLastActivity = now
-				local pending = pendingMeterEvents[key]
-
-				-- A delta arriving right after the player cast this spell is
-				-- its direct hit: show it immediately (single-hit instant
-				-- spells must not wait for the grouping window). Ticks (no
-				-- recent cast), channels, and already-accumulating spells are
-				-- sustained damage and keep being grouped; weapon hits (no
-				-- cast) also group.
-				local isDirectHit = pending == nil
-					and not channelledSpells[spellID]
-					and recentPlayerCasts[spellID]
-					and (now - recentPlayerCasts[spellID]) <= DIRECT_HIT_WINDOW
-
-				if isDirectHit then
-					local spellName = ResolveMeterSpellName(spellID)
-					-- sourceName is set so HealHandler's self-heal check
-					-- (sourceName == recipientName) cannot misfire on the
-					-- synthetic event's nil fields: the meter cannot tell
-					-- who received the heal, so everything stays OUTGOING.
-					local parserEvent = { eventType = eventType, sourceUnit = "player", sourceName = playerName, amount = delta }
-					if spellName then
-						parserEvent.skillID = spellID
-						parserEvent.skillName = spellName
-					end
-					if eventType == "heal" and overhealDelta and overhealDelta > 0 then
-						parserEvent.overhealAmount = overhealDelta
-					end
-					ParserEventsHandler(parserEvent)
-				else
-					if not pending then
-						pending = { eventType = eventType, spellID = spellID, amount = 0, hitWindows = 0 }
-						pendingMeterEvents[key] = pending
-					end
-					pending.amount = pending.amount + delta
-					if eventType == "heal" and overhealDelta and overhealDelta > 0 then
-						pending.overhealAmount = (pending.overhealAmount or 0) + overhealDelta
-					end
-					pending.hitWindows = pending.hitWindows + 1
-					pending.lastIncrease = now
+				-- Accumulate per spell name and flush on the aggregation window
+				-- (see FlushPendingMeterEvents below).
+				local spellName = GetSpellInfo(spellID)
+				local pendingKey = damageMeterType .. ":" .. (spellName or tostring(spellID))
+				local pending = pendingMeterEvents[pendingKey]
+				if not pending then
+					pending = { eventType = eventType, spellID = spellID, spellName = spellName, amount = 0 }
+					pendingMeterEvents[pendingKey] = pending
 				end
+				pending.amount = pending.amount + delta
 			end
 		end
 	end
 end
 
 -- ****************************************************************************
--- Displays one accumulated spell's total: "<Spell> (<hits>) <amount>", or the
--- plain amount for weapon hits (no resolvable spell name). Called either when
--- the spell has been quiet for METER_IDLE_FLUSH_TIME seconds or at combat end.
+-- Emits the aggregated meter deltas: one event per spell per window, all in a
+-- single frame so MSBT's own merge pipeline can coalesce further.
 -- ****************************************************************************
-local function FlushPendingMeterEvent(key)
-	local pending = pendingMeterEvents[key]
-	if not pending then return end
-	pendingMeterEvents[key] = nil
-
-	if pending.amount <= 0 then return end
-
-	local spellName = ResolveMeterSpellName(pending.spellID)
-	-- sourceName set for the same reason as in PollDamageMeterSource: keeps
-	-- grouped heals OUTGOING instead of misclassified as self-heals.
-	local parserEvent = { eventType = pending.eventType, sourceUnit = "player", sourceName = UnitName("player"), amount = pending.amount }
-	if spellName then
-		parserEvent.skillID = pending.spellID
-		parserEvent.skillName = spellName .. " (" .. pending.hitWindows .. ")"
+local function FlushPendingMeterEvents()
+	for _, pending in pairs(pendingMeterEvents) do
+		ParserEventsHandler({
+			eventType = pending.eventType,
+			sourceUnit = "player",
+			amount = pending.amount,
+			skillID = pending.spellID,
+			skillName = pending.spellName,
+		})
 	end
-	if pending.eventType == "heal" and pending.overhealAmount then
-		parserEvent.overhealAmount = pending.overhealAmount
-	end
-	ParserEventsHandler(parserEvent)
+	EraseTable(pendingMeterEvents)
 end
 
--- One-time warning if the poll itself errors (e.g. an unexpected secret-value
--- arithmetic path) - without it a broken ticker would silently display nothing.
-local meterPollErrorWarned = false
+-- ****************************************************************************
+-- In-combat meter sampling (diagnostics). The /run DebugMeterInfo() output
+-- that was captured earlier was always taken AFTER combat, when Forever
+-- relaxes its Secret Values restrictions - so it only ever saw plain numbers
+-- and could not tell whether the feed is usable DURING combat, which is the
+-- only state that matters for the display. While in combat, this records
+-- every 5 seconds (max 8 samples per fight) whether the GUID source lookup
+-- succeeds and whether each spell's spellID/totalAmount can be unwrapped
+-- with "value + 0" (the exact gate the meter engine uses). The lines are
+-- stored in the saved variable MSBT_DebugDiagnostics (written to
+--   WTF\Account\<account>\SavedVariables\MikScrollingBattleText.lua
+-- on the next /reload or logout) and reset at the start of each fight.
+-- ****************************************************************************
+local combatMeterSampleLines = {}
+local combatMeterSampleCount = 0
+local meterCombatStartTime = nil
+local lastMeterSampleTime = 0
+
+local function SafeSampleText(value)
+	if value == nil then return "nil" end
+	if issecretvalue and issecretvalue(value) then return "<secret>" end
+	local ok, text = pcall(tostring, value)
+	return ok and text or "<unprintable>"
+end
+
+-- Describes one combatSpells entry the way the engine consumes it: does the
+-- SafeAddZero gate ("value + 0" in a pcall) succeed, i.e. is the value plain?
+local function DescribeMeterEntry(entry)
+	local parts = {}
+	local okID, unwrappedID = pcall(function() return entry.spellID + 0 end)
+	if okID and type(unwrappedID) == "number" then
+		parts[#parts + 1] = "id=" .. SafeSampleText(unwrappedID) .. "(plain)"
+	else
+		parts[#parts + 1] = "id=" .. SafeSampleText(entry.spellID) .. "(SECRET-or-nonnumeric)"
+	end
+	local okTotal, unwrappedTotal = pcall(function() return entry.totalAmount + 0 end)
+	if okTotal and type(unwrappedTotal) == "number" then
+		parts[#parts + 1] = "total=" .. SafeSampleText(unwrappedTotal) .. "(plain)"
+	else
+		parts[#parts + 1] = "total=" .. SafeSampleText(entry.totalAmount) .. "(SECRET-or-nonnumeric)"
+	end
+	return table.concat(parts, " ")
+end
+
+local function SampleMeterCombatState()
+	if not C_DamageMeter or not InCombatLockdown() then return end
+	local now = GetTime()
+	if now - lastMeterSampleTime < 5 then return end
+	lastMeterSampleTime = now
+	if combatMeterSampleCount >= 8 then return end
+	combatMeterSampleCount = combatMeterSampleCount + 1
+
+	local okGUID, playerGUID = pcall(UnitGUID, "player")
+	local parts = { "sample#" .. combatMeterSampleCount .. " t=+" .. string_format("%.0f", now - (meterCombatStartTime or now)) .. "s" }
+	for _, spec in ipairs({ { "DD", Enum.DamageMeterType.DamageDone }, { "HD", Enum.DamageMeterType.HealingDone } }) do
+		local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, spec[2], playerGUID)
+		if not okSource or not source or type(source.combatSpells) ~= "table" then
+			parts[#parts + 1] = spec[1] .. ":lookup-failed"
+		else
+			parts[#parts + 1] = spec[1] .. ":n=" .. #source.combatSpells
+			for i = 1, math.min(2, #source.combatSpells) do
+				parts[#parts + 1] = spec[1] .. i .. "{" .. DescribeMeterEntry(source.combatSpells[i]) .. "}"
+			end
+		end
+	end
+	combatMeterSampleLines[#combatMeterSampleLines + 1] = table.concat(parts, " ")
+	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = combatMeterSampleLines }
+end
 
 -- ****************************************************************************
--- Polls both damage and healing done by the player, then flushes every spell
--- that has been quiet for METER_IDLE_FLUSH_TIME seconds.
+-- Polls both damage and healing done by the player.
 -- ****************************************************************************
 local function PollDamageMeter()
-	-- The availability/CVar checks are warnings only (see WarnMeterStateOnce):
-	-- polling unconditionally avoids silently dead feeds when a check can't be
-	-- confirmed on this client.
-	local okDamage, damageError = pcall(PollDamageMeterSource, DM_DAMAGEDONE, "damage")
-	local okHeal, healError = pcall(PollDamageMeterSource, DM_HEALINGDONE, "heal")
-	if (not okDamage or not okHeal) and not meterPollErrorWarned then
-		meterPollErrorWarned = true
-		print("|cffff7d0aMSBT:|r damage meter poll error: " .. SafeText(not okDamage and damageError or healError) .. " (run /run MikSBT.DebugMeterInfo())")
+	-- Damage: stand down when the combat log (other clients) or UNIT_COMBAT
+	-- (solo on Forever) is already delivering the player's outgoing hits, so
+	-- the same hit is never shown twice.
+	if not (outgoingLogSeen or unitCombatOutgoingSeen) then
+		PollDamageMeterSource(Enum.DamageMeterType.DamageDone, "damage")
 	end
 
-	local now = GetTime()
-	for key, pending in pairs(pendingMeterEvents) do
-		if now - pending.lastIncrease >= METER_IDLE_FLUSH_TIME then
-			FlushPendingMeterEvent(key)
-		end
+	-- Healing done: the meter is the sole source for outgoing heals on Forever
+	-- (UNIT_COMBAT can't attribute a heal to a caster, and self-heals would
+	-- otherwise show up twice), so nothing stands it down here.
+	PollDamageMeterSource(Enum.DamageMeterType.HealingDone, "heal")
+
+	-- Flush the aggregated deltas on the window so the combat text shows one
+	-- line per spell per window instead of a fragment every poll.
+	if GetTime() - lastMeterFlushTime >= METER_FLUSH_INTERVAL then
+		lastMeterFlushTime = GetTime()
+		FlushPendingMeterEvents()
 	end
+
+	-- Auto-diagnostic: record what the meter returns MID-COMBAT (throttled
+	-- inside; see SampleMeterCombatState).
+	SampleMeterCombatState()
 end
 
 -- ****************************************************************************
 -- Diagnostic: /run MikSBT.DebugMeterInfo()
--- Prints what C_DamageMeter currently returns so attribution problems can be
--- diagnosed live: whether the meter is tracking, whether the local player is
--- present in the session, and which spells the GUID-keyed source lookup
--- reports (with amounts or <secret> markers). Also prints the feed state
--- (ticker, last activity, pending events).
+-- Prints what C_DamageMeter currently returns so it can be verified whether
+-- the meter feed actually delivers usable (non-secret) data on this client:
+-- availability, session sources with the local player flag, and the per-spell
+-- entries the GUID-keyed source lookup reports (amounts or <secret> markers).
 --
 -- The same lines are stored in the saved variable MSBT_DebugDiagnostics,
 -- which the client writes to
@@ -1958,51 +1903,57 @@ end
 -- on the next /reload or logout, so the output can be inspected on disk
 -- without copying it out of the in-game chat.
 -- ****************************************************************************
+local function SafeDebugText(value)
+	if value == nil then return "nil" end
+	if issecretvalue and issecretvalue(value) then return "<secret>" end
+	local ok, text = pcall(tostring, value)
+	return ok and text or "<unprintable>"
+end
+
+local function DebugMeterLine(lines, text)
+	lines[#lines + 1] = text
+	print(text)
+end
+
 function MikSBT.DebugMeterInfo()
 	local lines = {}
-	local function DebugLine(text)
-		lines[#lines + 1] = text
-		print(text)
-	end
-
 	if not C_DamageMeter then
-		DebugLine("MSBT meter: C_DamageMeter API not present on this client")
+		DebugMeterLine(lines, "MSBT meter: C_DamageMeter API not present on this client")
 		MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = lines }
 		return
 	end
 
-	DebugLine("MSBT meter: tickerRunning=" .. tostring(damageMeterTicker ~= nil) ..
-		" lastActivity=" .. (meterLastActivity and string_format("%.1fs ago", GetTime() - meterLastActivity) or "never") ..
-		" pendingEvents=" .. tostring((function() local n = 0 for _ in pairs(pendingMeterEvents) do n = n + 1 end return n end)()) ..
-		" trackedTotals=" .. tostring((function() local n = 0 for _ in pairs(damageMeterLastTotals) do n = n + 1 end return n end)()))
-
 	local okAvailable, isAvailable, failureReason = pcall(C_DamageMeter.IsDamageMeterAvailable)
-	DebugLine("MSBT meter: IsDamageMeterAvailable=" .. SafeText(isAvailable) .. " reason=" .. SafeText(failureReason))
+	DebugMeterLine(lines, "MSBT meter: IsDamageMeterAvailable=" .. SafeDebugText(isAvailable) .. " reason=" .. SafeDebugText(failureReason))
 	local okEnabled, enabled = pcall(function() return GetCVarBool("damageMeterEnabled") end)
-	DebugLine("MSBT meter: damageMeterEnabled=" .. (okEnabled and SafeText(enabled) or "unknown"))
+	DebugMeterLine(lines, "MSBT meter: damageMeterEnabled=" .. (okEnabled and SafeDebugText(enabled) or "unknown"))
 
-	for _, meterType in ipairs({ { DM_DAMAGEDONE, "DamageDone" }, { DM_HEALINGDONE, "HealingDone" } }) do
+	local damageMeterType = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.DamageDone) or 0
+	local healingMeterType = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.HealingDone) or 2
+
+	for _, meterType in ipairs({ { damageMeterType, "DamageDone" }, { healingMeterType, "HealingDone" } }) do
 		local okSession, session = pcall(C_DamageMeter.GetCombatSessionFromType, 0, meterType[1])
 		if not okSession or not session or type(session.combatSources) ~= "table" then
-			DebugLine("MSBT meter [" .. meterType[2] .. "]: no session data")
+			DebugMeterLine(lines, "MSBT meter [" .. meterType[2] .. "]: no session data (call error=" .. tostring(not okSession) .. ")")
 		else
 			local localPlayerFound = false
 			for _, combatSource in ipairs(session.combatSources) do
 				if combatSource.isLocalPlayer then localPlayerFound = true break end
 			end
-			DebugLine("MSBT meter [" .. meterType[2] .. "]: sources=" .. #session.combatSources .. " localPlayerInSession=" .. tostring(localPlayerFound))
+			DebugMeterLine(lines, "MSBT meter [" .. meterType[2] .. "]: sources=" .. #session.combatSources .. " localPlayerInSession=" .. tostring(localPlayerFound))
 
 			local okGUID, playerGUID = pcall(UnitGUID, "player")
 			local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, meterType[1], playerGUID)
 			if not okSource or not source or type(source.combatSpells) ~= "table" then
-				DebugLine("MSBT meter [" .. meterType[2] .. "]: GUID source lookup failed or empty")
+				DebugMeterLine(lines, "MSBT meter [" .. meterType[2] .. "]: GUID source lookup failed or empty")
 			else
-				DebugLine("MSBT meter [" .. meterType[2] .. "]: GUID source spells=" .. #source.combatSpells)
+				DebugMeterLine(lines, "MSBT meter [" .. meterType[2] .. "]: GUID source spells=" .. #source.combatSpells)
 				for i, spell in ipairs(source.combatSpells) do
-					if i > 10 then DebugLine("  ...") break end
+					if i > 10 then DebugMeterLine(lines, "  ...") break end
 					local spellID = SafeAddZero(spell.spellID)
-					local name = spellID and ResolveMeterSpellName(spellID) or nil
-					DebugLine("  spellID=" .. SafeText(spellID) .. " name=" .. SafeText(name) .. " total=" .. SafeText(SafeAddZero(spell.totalAmount)))
+					local spellName
+					if spellID then spellName = GetSpellInfo(spellID) end
+					DebugMeterLine(lines, "  spellID=" .. SafeDebugText(spellID) .. " name=" .. SafeDebugText(spellName) .. " total=" .. SafeDebugText(SafeAddZero(spell.totalAmount)))
 				end
 			end
 		end
@@ -2011,6 +1962,7 @@ function MikSBT.DebugMeterInfo()
 	-- Stored in the SavedVariables so the client writes it to disk on the
 	-- next /reload or logout (see the TOC's SavedVariables entry).
 	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = lines }
+	print("MSBT meter: saved to SavedVariables - run /reload to write it to disk")
 end
 
 -- ****************************************************************************
@@ -2022,20 +1974,17 @@ local function StartDamageMeterFallback()
 	if not damageMeterAvailable() or not (MikSBT.combatLogBlocked or MikSBT.Client.isForever) or damageMeterTicker then
 		return
 	end
-
-	WarnMeterStateOnce()
-
-	-- damageMeterLastTotals is deliberately NOT cleared here: the meter
-	-- session totals persist across pulls (or reset to 0), and in both cases
-	-- the "delta < 0" handling in PollDamageMeterSource keeps deltas correct.
-	-- Clearing them here would re-emit the whole accumulated total as one
-	-- giant number at the start of every fight.
-	--
-	-- recentPlayerCasts is NOT cleared either: the spell that *starts* a fight
-	-- is often cast right before combat begins, and stale entries can't cause
-	-- false direct-hits (they only match within DIRECT_HIT_WINDOW seconds).
+	for key in pairs(damageMeterLastTotals) do damageMeterLastTotals[key] = nil end
 	EraseTable(pendingMeterEvents)
-	EraseTable(channelledSpells)
+	lastMeterFlushTime = GetTime()
+
+	-- Reset the in-combat meter diagnostics for the new fight (see
+	-- SampleMeterCombatState).
+	combatMeterSampleLines = {}
+	combatMeterSampleCount = 0
+	lastMeterSampleTime = 0
+	meterCombatStartTime = GetTime()
+
 	damageMeterTicker = C_Timer.NewTicker(0.5, PollDamageMeter)
 end
 
@@ -2049,10 +1998,8 @@ local function StopDamageMeterFallback()
 	end
 
 	-- Show any accumulated damage/healing from the tail of the fight instead
-	-- of dropping it because the idle flush never came.
-	for key in pairs(pendingMeterEvents) do
-		FlushPendingMeterEvent(key)
-	end
+	-- of dropping it because the next flush never came.
+	FlushPendingMeterEvents()
 end
 
 
@@ -2080,19 +2027,31 @@ function eventFrame:PLAYER_REGEN_DISABLED()
 		DisplayEvent(eventSettings, eventSettings.message)
 	end
 
+	-- Fresh combat: UNIT_COMBAT (solo) takes the outgoing lead again until it
+	-- actually delivers, at which point the damage meter stands down.
+	unitCombatOutgoingSeen = false
+
 	StartDamageMeterFallback()
 end
 
 
 -- ****************************************************************************
--- Forever fallback: the combat log delivers nothing usable there, so the
--- C_DamageMeter feed is the SOLE source for outgoing damage and healing (it
--- is keyed to the player's own GUID, so it can never show anyone else's
--- damage, and it reports each spell - including weapon hits - under its own
--- spellID). UNIT_COMBAT only contributes incoming damage/misses on the player
--- and, solo only, outgoing misses on the target. The incoming direction stands
--- down once a real combat log event for the player has been parsed (see
--- incomingLogSeen), so nothing is ever shown twice.
+-- Regrouping mid-combat switches the outgoing authority (meter <-> UNIT_COMBAT);
+-- reset the stand-down flag so the new authority takes over cleanly.
+-- ****************************************************************************
+function eventFrame:GROUP_ROSTER_UPDATE()
+	unitCombatOutgoingSeen = false
+end
+
+
+-- ****************************************************************************
+-- Forever fallback: the combat log delivers nothing usable there, so outgoing
+-- damage/misses (solo) and incoming damage/misses are derived from UNIT_COMBAT,
+-- attributed to whichever spell the player last cast. Outgoing healing always
+-- comes from the C_DamageMeter feed instead (see PollDamageMeter - UNIT_COMBAT
+-- can't attribute heals). Each direction stands down once another source
+-- delivers it (see incomingLogSeen/outgoingLogSeen/unitCombatOutgoingSeen),
+-- so nothing is ever shown twice.
 -- ****************************************************************************
 -- Secret strings (e.g. UnitName("target") in combat) can't be compared or
 -- merged on, so drop them from the synthetic events below.
@@ -2101,34 +2060,26 @@ local function NonSecret(value)
 	return value
 end
 
+local function RecordPlayerSpell(unitID, spellID)
+	if unitID ~= "player" then return end
+	local ok, id = pcall(function() return spellID + 0 end)
+	if ok and type(id) == "number" then
+		lastPlayerSpellID, lastPlayerSpellTime = id, GetTime()
+	end
+end
+
+-- The heal/damage from a cast lands with (or before) UNIT_SPELLCAST_SUCCEEDED,
+-- so casts are also recorded when they start and are sent.
+function eventFrame:UNIT_SPELLCAST_SUCCEEDED(unitID, _, spellID) RecordPlayerSpell(unitID, spellID) end
+function eventFrame:UNIT_SPELLCAST_START(unitID, _, spellID) RecordPlayerSpell(unitID, spellID) end
+function eventFrame:UNIT_SPELLCAST_SENT(unitID, _, _, spellID) RecordPlayerSpell(unitID, spellID) end
+
 -- UNIT_COMBAT actions that map to MSBT miss types. The action doubles as the
 -- missType string the MissHandler and the profile events expect.
 local missActions = {
 MISS = true, DODGE = true, PARRY = true, BLOCK = true,
 RESIST = true, ABSORB = true, IMMUNE = true, REFLECT = true,
 }
-
--- Records the player's own casts so the meter feed can tell a spell's direct
--- hit (delta right after the cast) from its periodic ticks (see
--- DIRECT_HIT_WINDOW). Channelled spells are flagged as sustained damage for
--- their whole duration.
-function eventFrame:UNIT_SPELLCAST_SUCCEEDED(unitID, _, spellID)
-	if unitID ~= "player" then return end
-	local ok, id = pcall(function() return spellID + 0 end)
-	if ok and type(id) == "number" then recentPlayerCasts[id] = GetTime() end
-end
-
-function eventFrame:UNIT_SPELLCAST_CHANNEL_START(unitID, _, spellID)
-	if unitID ~= "player" then return end
-	local ok, id = pcall(function() return spellID + 0 end)
-	if ok and type(id) == "number" then channelledSpells[id] = true end
-end
-
-function eventFrame:UNIT_SPELLCAST_CHANNEL_STOP(unitID, _, spellID)
-	if unitID ~= "player" then return end
-	local ok, id = pcall(function() return spellID + 0 end)
-	if ok and type(id) == "number" then channelledSpells[id] = nil end
-end
 
 function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask)
 	if not action or (issecretvalue and issecretvalue(action)) then return end
@@ -2149,17 +2100,48 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 	-- hardened to handle them safely.
 	if isWound and amount ~= nil and not (issecretvalue and issecretvalue(amount)) and amount <= 0 then return end
 
-	-- Outgoing misses (solo only). UNIT_COMBAT on the target cannot say WHO
-	-- missed, so in a group a party member's miss would show as the player's
-	-- own - they are dropped there. Outgoing damage/healing never comes from
-	-- UNIT_COMBAT at all (it is unattributable and would mix spells with
-	-- weapon hits); the player-only C_DamageMeter feed is the sole authority
-	-- for that (see PollDamageMeter).
+	-- Outgoing damage/misses: UNIT_COMBAT on the target, attributed to the last
+	-- spell the player cast.
+	--
+	-- Forever authority split (only the player's own damage, never twice):
+	--   * Group: UNIT_COMBAT on the target can't tell WHO dealt the hit, so
+	--     party members attacking the same target would show up as the
+	--     player's own damage. The player-only C_DamageMeter feed is the sole
+	--     authority there and UNIT_COMBAT stands down entirely (wounds AND
+	--     misses). If the meter API is unavailable, UNIT_COMBAT stays as the
+	--     last resort (nothing else delivers, so no duplication is possible).
+	--   * Solo: UNIT_COMBAT is authoritative (per-hit detail, crits, misses,
+	--     damage schools) and flags it so the meter stands down (see
+	--     PollDamageMeter) instead of re-showing the same hits as aggregates.
 	if unitTarget == "target" then
-		if outgoingLogSeen or IsInGroup() or not InCombatLockdown() then return end
-		if not isMiss then return end
-		ParserEventsHandler({eventType = "miss", sourceUnit = "player", missType = action,
-			recipientName = NonSecret(UnitName("target"))})
+		if outgoingLogSeen or not InCombatLockdown() then return end
+		if IsInGroup() and damageMeterAvailable() then return end
+		unitCombatOutgoingSeen = true
+
+		local skillID, skillName
+		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 4 then
+			skillID = lastPlayerSpellID
+			skillName = GetSpellInfo(skillID)
+		end
+
+		local parserEvent = {
+			sourceUnit = "player",
+			recipientName = NonSecret(UnitName("target")),
+			isCrit = isCrit,
+			skillID = skillID,
+			skillName = skillName,
+		}
+		if isWound then
+			parserEvent.eventType = "damage"
+			parserEvent.amount = amount
+			-- schoolMask shares the numeric domain with the old combat log damage
+			-- schools, so it can color the amount directly.
+			if schoolMask and not (issecretvalue and issecretvalue(schoolMask)) then parserEvent.damageType = schoolMask end
+		else
+			parserEvent.eventType = "miss"
+			parserEvent.missType = action
+		end
+		ParserEventsHandler(parserEvent)
 		return
 	end
 
@@ -2207,8 +2189,9 @@ local function Enable()
 	if MikSBT.Client.isForever then
 		eventFrame:RegisterEvent("UNIT_COMBAT")
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
-		eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
-		eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
+		eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
+		eventFrame:RegisterEvent("UNIT_SPELLCAST_SENT")
+		eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 	end
 
 	-- Register the parser events handler.

@@ -3,56 +3,28 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.4.0] - 2026-11-11
+## [1.4.1] - 2026-11-11
 
-### Fixed
-- **Outgoing damage displayed nothing again (v1.3.0).** The attribution
-  cross-check compared the session total and the GUID-keyed source total taken
-  from two API calls at different moments - during active combat the totals
-  grow in between, so the check produced false mismatches and silently skipped
-  poll after poll. Removed: attribution is guaranteed by the GUID-keyed
-  lookup alone (in-game diagnostics already proved it returns exactly the
-  local player's spells). The poll is now also wrapped in a pcall with a
-  one-time chat warning, so a broken poll can never again fail silently.
-- **Outgoing heals never displayed.** The synthetic heal events lacked
-  `sourceName`/`recipientName`, and HealHandler's self-heal check
-  (`sourceName == recipientName`) misfired on `nil == nil`, reclassifying them
-  as `SELF_HEAL` events. The meter feed now sets `sourceName`, so heals
-  display as `OUTGOING_HEAL` (the meter cannot tell who received the heal, so
-  everything stays outgoing).
+### Reverted
+- **Outgoing damage went dark again in v1.3.0/v1.4.0 - the meter-only engine
+  is not viable DURING combat on Forever.** The diagnosis: the earlier
+  `/run MikSBT.DebugMeterInfo()` captures were always taken *after* combat,
+  when the client relaxes its Secret Values restrictions, so the meter feed
+  looked fully usable - but mid-combat the spellID/totalAmount values cannot
+  be unwrapped, and the engine silently produces nothing. The working engine
+  (v1.1.2: solo UNIT_COMBAT on the target for outgoing damage/misses,
+  C_DamageMeter as backup) is restored exactly, as of the v1.2.4 state
+  (commit 4fa2bb3). The v1.4.0 heal/overheal work is undone with it and will
+  be re-built on top of the working engine.
 
 ### Added
-- **Overheal display for outgoing heals**: the meter exposes the healing done
-  above the target's max health as `overkillAmount` on HealingDone entries;
-  it is now accumulated per spell and passed as `overhealAmount`, which MSBT's
-  FormatEvent already renders as the `<overheal>` trailer (profile option
-  `overheal`, enabled by default).
-
-## [1.3.0] - 2026-11-11
-
-### Restored
-- **The 1.2.x per-spell outgoing engine is back (v1.2.2 state), now properly
-  verified.** The earlier "no damage at all" reports were caused by the addon
-  being *disabled* in the client's addon list (its SavedVariables file was not
-  being written on /reload - that is how it was detected), so the engine had
-  never actually been tested. In-game diagnostics confirmed the
-  `C_DamageMeter` feed delivers fully usable (non-secret) per-spell totals on
-  Forever - with melee under its own spellID (6603) - even with Blizzard's
-  meter toggle off, so the engine is viable.
-- Includes everything from v1.2.2: per-spell attribution (weapon hits render
-  as plain melee numbers), player-only GUID filter + total cross-check (only a
-  provable mismatch skips data), instant direct-hit display (meter delta
-  within 1s of the cast), sustained-damage grouping (`Spell (hits) total`
-  flushed after 3.5s idle or at combat end), and no combat-start baseline
-  clearing.
-
-### Changed
-- The misleading `damageMeterEnabled` warning was removed: the feed is proven
-  to work with the toggle off on Forever.
-- `MikSBT.DebugMeterInfo()` keeps the disk-export enhancement (stores its
-  lines in the `MSBT_DebugDiagnostics` saved variable for
-  `WTF\...\SavedVariables\MikScrollingBattleText.lua`), now including the
-  feed state line (ticker, last activity, pending events, tracked totals).
+- **In-combat meter sampling (auto-diagnostics)**: while in combat, every 5s
+  (max 8 per fight) the addon records whether the `C_DamageMeter` GUID source
+  lookup succeeds and whether each spell's `spellID`/`totalAmount` can be
+  unwrapped with `value + 0` (the exact gate the meter engine uses). Stored
+  in the `MSBT_DebugDiagnostics` saved variable (readable from disk after
+  /reload), reset per fight. This will settle with hard evidence what the
+  meter delivers mid-combat before any further engine work.
 
 ## [1.2.3] - 2026-11-11
 
