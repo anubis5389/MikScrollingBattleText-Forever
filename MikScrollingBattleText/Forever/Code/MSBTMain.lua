@@ -144,6 +144,14 @@ local lastPlayerSpellID, lastPlayerSpellTime = nil, 0
 -- Forever: set when UNIT_COMBAT delivers an outgoing hit (solo); makes the
 -- C_DamageMeter fallback stand down so the same hit is never shown twice.
 local unitCombatOutgoingSeen = false
+-- Same as above for self-heals: set when UNIT_COMBAT delivers a heal on the
+-- player (solo only), standing down the meter's healing-done feed.
+local unitCombatHealSeen = false
+-- Spells observed to be heals (a UNIT_COMBAT heal on the player arrived right
+-- after casting them). Used to keep heal casts from being used to attribute
+-- damage hits in the target branch (a DoT tick must not inherit the name of
+-- a heal cast within the attribution window).
+local playerHealSpellIDs = {}
 local damageTypeMap = {}
 local damageColorProfileEntries = {}
 local powerTokens = {}
@@ -1859,6 +1867,7 @@ local function SampleMeterCombatState()
 		end
 	end
 	combatMeterSampleLines[#combatMeterSampleLines + 1] = table.concat(parts, " ")
+	if #combatMeterSampleLines > 100 then table_remove(combatMeterSampleLines, 1) end
 	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = combatMeterSampleLines }
 end
 
@@ -1873,10 +1882,13 @@ local function PollDamageMeter()
 		PollDamageMeterSource(Enum.DamageMeterType.DamageDone, "damage")
 	end
 
-	-- Healing done: the meter is the sole source for outgoing heals on Forever
-	-- (UNIT_COMBAT can't attribute a heal to a caster, and self-heals would
-	-- otherwise show up twice), so nothing stands it down here.
-	PollDamageMeterSource(Enum.DamageMeterType.HealingDone, "heal")
+	-- Healing done: the meter is the healing source in groups (UNIT_COMBAT
+	-- can't attribute a heal to a caster there). Solo it stands down once
+	-- UNIT_COMBAT has delivered the player's self-heals, so the same heal is
+	-- never shown twice (see the UNIT_COMBAT player branch).
+	if not unitCombatHealSeen then
+		PollDamageMeterSource(Enum.DamageMeterType.HealingDone, "heal")
+	end
 
 	-- Flush the aggregated deltas on the window so the combat text shows one
 	-- line per spell per window instead of a fragment every poll.
@@ -1915,11 +1927,23 @@ local function DebugMeterLine(lines, text)
 	print(text)
 end
 
+-- Stores the diagnostics in the SavedVariables (written to disk on /reload),
+-- PREPENDING the automatic in-combat samples so a manual /run capture never
+-- wipes the evidence collected mid-fight (that is how the first samples were
+-- lost).
+local function SaveMeterDiagnostics(lines)
+	local merged = {}
+	for _, line in ipairs(combatMeterSampleLines) do merged[#merged + 1] = line end
+	merged[#merged + 1] = "=== manual /run capture " .. date("%H:%M:%S") .. " ==="
+	for _, line in ipairs(lines) do merged[#merged + 1] = line end
+	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = merged }
+end
+
 function MikSBT.DebugMeterInfo()
 	local lines = {}
 	if not C_DamageMeter then
 		DebugMeterLine(lines, "MSBT meter: C_DamageMeter API not present on this client")
-		MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = lines }
+		SaveMeterDiagnostics(lines)
 		return
 	end
 
@@ -1961,7 +1985,7 @@ function MikSBT.DebugMeterInfo()
 
 	-- Stored in the SavedVariables so the client writes it to disk on the
 	-- next /reload or logout (see the TOC's SavedVariables entry).
-	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = lines }
+	SaveMeterDiagnostics(lines)
 	print("MSBT meter: saved to SavedVariables - run /reload to write it to disk")
 end
 
@@ -1978,12 +2002,13 @@ local function StartDamageMeterFallback()
 	EraseTable(pendingMeterEvents)
 	lastMeterFlushTime = GetTime()
 
-	-- Reset the in-combat meter diagnostics for the new fight (see
-	-- SampleMeterCombatState).
-	combatMeterSampleLines = {}
+	-- In-combat meter diagnostics: samples accumulate ACROSS fights (capped;
+	-- see SampleMeterCombatState) so a /run DebugMeterInfo() after the fight
+	-- still carries the mid-combat evidence - only a marker is added per fight.
 	combatMeterSampleCount = 0
 	lastMeterSampleTime = 0
 	meterCombatStartTime = GetTime()
+	combatMeterSampleLines[#combatMeterSampleLines + 1] = "--- fight start ---"
 
 	damageMeterTicker = C_Timer.NewTicker(0.5, PollDamageMeter)
 end
@@ -2030,6 +2055,7 @@ function eventFrame:PLAYER_REGEN_DISABLED()
 	-- Fresh combat: UNIT_COMBAT (solo) takes the outgoing lead again until it
 	-- actually delivers, at which point the damage meter stands down.
 	unitCombatOutgoingSeen = false
+	unitCombatHealSeen = false
 
 	StartDamageMeterFallback()
 end
@@ -2041,6 +2067,7 @@ end
 -- ****************************************************************************
 function eventFrame:GROUP_ROSTER_UPDATE()
 	unitCombatOutgoingSeen = false
+	unitCombatHealSeen = false
 end
 
 
@@ -2086,7 +2113,8 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 
 	local isWound = (action == "WOUND")
 	local isMiss = missActions[action]
-	if not isWound and not isMiss then return end
+	local isHeal = (action == "HEAL" or action == "HEAL_CRIT")
+	if not isWound and not isMiss and not isHeal then return end
 
 	-- Compound flags (e.g. critical + glancing/block variants) require substring
 	-- matching; flagText must be a plain string for pattern work.
@@ -2119,7 +2147,10 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 		unitCombatOutgoingSeen = true
 
 		local skillID, skillName
-		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 4 then
+		-- Heal casts (spells observed to produce a UNIT_COMBAT heal on the
+		-- player) are excluded: a DoT/weapon tick within the attribution
+		-- window must not inherit a heal spell's name.
+		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 4 and not playerHealSpellIDs[lastPlayerSpellID] then
 			skillID = lastPlayerSpellID
 			skillName = GetSpellInfo(skillID)
 		end
@@ -2151,12 +2182,38 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 			damageType = (schoolMask and not (issecretvalue and issecretvalue(schoolMask))) and schoolMask or nil})
 	elseif isMiss then
 		ParserEventsHandler({eventType = "miss", recipientUnit = "player", missType = action})
+	elseif isHeal then
+		-- SOLO: a heal landing on the player is the player's own heal - the
+		-- same authority rule as outgoing wounds (the meter's healing-done
+		-- feed does not deliver mid-combat, so without this no heal would
+		-- ever display). It is shown as an outgoing heal and attributed to
+		-- the cast that just finished; that spell is also marked as a heal
+		-- so it never attributes damage (see the target branch). HoT ticks
+		-- with no recent cast show as plain heal amounts.
+		-- GROUP: UNIT_COMBAT can't say who healed, so this is skipped and the
+		-- meter stays the sole healing source (see PollDamageMeter).
+		if IsInGroup() then return end
+		unitCombatHealSeen = true
+
+		local skillID, skillName
+		if lastPlayerSpellID and GetTime() - lastPlayerSpellTime <= 2 then
+			skillID = lastPlayerSpellID
+			playerHealSpellIDs[skillID] = true
+			skillName = GetSpellInfo(skillID)
+		end
+
+		-- recipientUnit is set to a non-"player" token so GetInOutEventData
+		-- classifies the event as OUTGOING (it checks recipientUnit == "player"
+		-- first); the recipient name is the player, so the message reads as a
+		-- self-heal without going through the SELF_HEAL event settings.
+		ParserEventsHandler({eventType = "heal", sourceUnit = "player", recipientUnit = "target",
+			recipientName = NonSecret(UnitName("player")), amount = amount,
+			isCrit = isCrit or action == "HEAL_CRIT", skillID = skillID, skillName = skillName})
 	end
-	-- Note: heals on the player are intentionally NOT delivered here.
-	-- UNIT_COMBAT can't say who cast the heal, so a heal from another player
-	-- would be misattributed as the player's own, and self-heals would show up
-	-- twice (here and in the C_DamageMeter healing-done feed, which is the sole
-	-- outgoing-heal source on Forever - see PollDamageMeter).
+	-- Note: heals on the player IN A GROUP are intentionally NOT delivered
+	-- here - UNIT_COMBAT can't say who cast the heal, so a heal from another
+	-- player would be misattributed as the player's own. The C_DamageMeter
+	-- healing-done feed is the healing source there (see PollDamageMeter).
 end
 
 

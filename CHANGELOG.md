@@ -3,6 +3,29 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.2] - 2026-11-11
+
+### Fixed
+- **Outgoing heals never displayed (v1.1.2 engine)**: heals landing on the
+  player were deliberately excluded from `UNIT_COMBAT` and left to the
+  `C_DamageMeter` healing-done feed - which does not deliver mid-combat.
+  Solo, a `UNIT_COMBAT` heal on the player is now delivered as the player's
+  own outgoing heal (same authority rule as wounds), attributed to the cast
+  that just finished; in groups the meter stays the healing source (a heal
+  from another player cannot be attributed). The meter feed stands down once
+  `UNIT_COMBAT` has delivered heals, so nothing shows twice.
+- **DoT ticks inherited the name of a heal cast within the attribution
+  window** (e.g. a Flame Shock tick labeled as Healing Wave): spells observed
+  to produce a heal on the player are now marked as heals and excluded from
+  the damage attribution.
+
+### Changed
+- `DebugMeterInfo()` now PREPENDS the automatic in-combat samples instead of
+  overwriting them - running the manual capture after a fight no longer wipes
+  the mid-combat evidence (that is how the first samples were lost). Samples
+  also accumulate across fights (capped at 100 lines) with a fight-start
+  marker each.
+
 ## [1.4.1] - 2026-11-11
 
 ### Reverted
