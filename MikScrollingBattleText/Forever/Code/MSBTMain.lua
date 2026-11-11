@@ -1710,29 +1710,45 @@ local function SafeAddZero(value)
 	return nil
 end
 
+-- Availability is now existence-only: the CVar/IsDamageMeterAvailable checks
+-- turned out to silently block the whole outgoing feed on some setups (no
+-- damage displayed at all). They run as one-time warnings instead - the feed
+-- is attempted regardless, and the session cross-check below guards
+-- attribution.
 local function damageMeterAvailable()
-	if not C_DamageMeter then return false end
+	return C_DamageMeter and true or false
+end
 
-	-- The meter only tracks combat sessions while Blizzard's Damage Meter
-	-- feature is enabled; with the toggle off the API returns nothing at all.
-	local okEnabled, enabled = pcall(function() return GetCVarBool("damageMeterEnabled") end)
-	if okEnabled and enabled == false then
-		if not meterWarnedThisSession then
-			meterWarnedThisSession = true
-			print("|cffff7d0aMSBT:|r Blizzard Damage Meter tracking is disabled - outgoing damage/heal text needs it (enable: /console damageMeterEnabled 1)")
-		end
-		return false
-	end
-
-	local okAvailable, isAvailable = pcall(C_DamageMeter.IsDamageMeterAvailable)
-	if okAvailable and isAvailable == false then return false end
-
-	return true
+-- Renders any value as printable text without touching secret values.
+local function SafeText(value)
+	if value == nil then return "nil" end
+	if issecretvalue and issecretvalue(value) then return "<secret>" end
+	local ok, text = pcall(tostring, value)
+	return ok and text or "<unprintable>"
 end
 
 local damageMeterLastTotals = {}
 local damageMeterTicker
 local meterWarnedThisSession = false
+local meterMismatchWarned = false
+-- GetTime() of the last poll that saw a growing spell total; the diagnostics
+-- (/run MikSBT.DebugMeterInfo()) use it to tell a dead feed from a blocked one.
+local meterLastActivity = nil
+
+local function WarnMeterStateOnce()
+	if meterWarnedThisSession then return end
+	meterWarnedThisSession = true
+
+	local okEnabled, enabled = pcall(function() return GetCVarBool("damageMeterEnabled") end)
+	if okEnabled and enabled == false then
+		print("|cffff7d0aMSBT:|r Blizzard Damage Meter tracking is disabled - outgoing damage/heal text needs it (enable: /console damageMeterEnabled 1)")
+	end
+
+	local okAvailable, isAvailable, failureReason = pcall(C_DamageMeter.IsDamageMeterAvailable)
+	if okAvailable and isAvailable == false then
+		print("|cffff7d0aMSBT:|r Damage Meter API reports unavailable (reason: " .. SafeText(failureReason) .. ") - attempting to read the feed anyway")
+	end
+end
 
 -- Numeric meter type values (in-game-verified constants for the Midnight
 -- engine; Enum.DamageMeterType is used only when present, as a sanity check).
@@ -1780,24 +1796,37 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 	local okGUID, playerGUID = pcall(UnitGUID, "player")
 	if not okGUID or not playerGUID then return end
 
-	-- Session guard: the meter must actually be tracking the local player.
-	-- isLocalPlayer is NeverSecret so this is safe to read in combat. Without
-	-- this entry any data the source lookup returns is not guaranteed to be
-	-- the player's own and must not be displayed.
+	-- Attribution cross-check: read the session's local player total (isLocalPlayer
+	-- is NeverSecret) and compare it against the GUID-keyed source's total when
+	-- both can be unwrapped. Only a PROVABLE mismatch (both values plain and the
+	-- comparison succeeding) blocks this poll - a missing session, a secret value,
+	-- or an error all fail open, because silently blocking would leave the addon
+	-- showing nothing (that regression shipped in 1.2.0 and had to be reverted).
+	local sessionLocalTotal
 	local okSession, session = pcall(C_DamageMeter.GetCombatSessionFromType, 0, damageMeterType)
 	if okSession and session and session.combatSources then
-		local localPlayerInSession = false
 		for _, combatSource in ipairs(session.combatSources) do
 			if combatSource.isLocalPlayer then
-				localPlayerInSession = true
+				sessionLocalTotal = SafeAddZero(combatSource.totalAmount)
 				break
 			end
 		end
-		if not localPlayerInSession then return end
 	end
 
 	local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, damageMeterType, playerGUID)
 	if not okSource or not source then return end
+
+	local sourceTotal = SafeAddZero(source.totalAmount)
+	if sourceTotal ~= nil and sessionLocalTotal ~= nil then
+		local okCompare, isEqual = pcall(function() return sourceTotal == sessionLocalTotal end)
+		if okCompare and isEqual == false then
+			if not meterMismatchWarned then
+				meterMismatchWarned = true
+				print("|cffff7d0aMSBT:|r damage meter source lookup does not match the session's local player - data skipped for safety (run /run MikSBT.DebugMeterInfo())")
+			end
+			return
+		end
+	end
 
 	local okSpells, combatSpells = pcall(function() return source.combatSpells end)
 	if not okSpells or type(combatSpells) ~= "table" then return end
@@ -1820,6 +1849,7 @@ local function PollDamageMeterSource(damageMeterType, eventType)
 
 			if delta > 0 then
 				local now = GetTime()
+				meterLastActivity = now
 				local pending = pendingMeterEvents[key]
 
 				-- A delta arriving right after the player cast this spell is
@@ -1881,10 +1911,11 @@ end
 -- that has been quiet for METER_IDLE_FLUSH_TIME seconds.
 -- ****************************************************************************
 local function PollDamageMeter()
-	if damageMeterAvailable() then
-		PollDamageMeterSource(DM_DAMAGEDONE, "damage")
-		PollDamageMeterSource(DM_HEALINGDONE, "heal")
-	end
+	-- The availability/CVar checks are warnings only (see WarnMeterStateOnce):
+	-- polling unconditionally avoids silently dead feeds when a check can't be
+	-- confirmed on this client.
+	PollDamageMeterSource(DM_DAMAGEDONE, "damage")
+	PollDamageMeterSource(DM_HEALINGDONE, "heal")
 
 	local now = GetTime()
 	for key, pending in pairs(pendingMeterEvents) do
@@ -1899,17 +1930,16 @@ end
 -- Prints what C_DamageMeter currently returns so attribution problems can be
 -- diagnosed live: whether the meter is tracking, whether the local player is
 -- present in the session, and which spells the GUID-keyed source lookup
--- reports (with amounts or <secret> markers).
+-- reports (with amounts or <secret> markers). Also prints the feed state
+-- (ticker, last activity, pending events).
 -- ****************************************************************************
-local function SafeText(value)
-	if value == nil then return "nil" end
-	if issecretvalue and issecretvalue(value) then return "<secret>" end
-	local ok, text = pcall(tostring, value)
-	return ok and text or "<unprintable>"
-end
-
 function MikSBT.DebugMeterInfo()
 	if not C_DamageMeter then print("MSBT meter: C_DamageMeter API not present on this client") return end
+
+	print("MSBT meter: tickerRunning=" .. tostring(damageMeterTicker ~= nil) ..
+		" lastActivity=" .. (meterLastActivity and string_format("%.1fs ago", GetTime() - meterLastActivity) or "never") ..
+		" pendingEvents=" .. tostring((function() local n = 0 for _ in pairs(pendingMeterEvents) do n = n + 1 end return n end)()) ..
+		" trackedTotals=" .. tostring((function() local n = 0 for _ in pairs(damageMeterLastTotals) do n = n + 1 end return n end)()))
 
 	local okAvailable, isAvailable, failureReason = pcall(C_DamageMeter.IsDamageMeterAvailable)
 	print("MSBT meter: IsDamageMeterAvailable=" .. SafeText(isAvailable) .. " reason=" .. SafeText(failureReason))
@@ -1953,6 +1983,8 @@ local function StartDamageMeterFallback()
 	if not damageMeterAvailable() or not (MikSBT.combatLogBlocked or MikSBT.Client.isForever) or damageMeterTicker then
 		return
 	end
+
+	WarnMeterStateOnce()
 
 	-- damageMeterLastTotals is deliberately NOT cleared here: the meter
 	-- session totals persist across pulls (or reset to 0), and in both cases
