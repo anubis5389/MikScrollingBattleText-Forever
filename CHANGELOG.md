@@ -3,6 +3,53 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.0] - 2026-11-15
+
+Complete redesign of the damage/healing pipeline ("Solo Combat Feed") after
+the v1.3-v1.4 meter-based engines failed to display damage on the Forever
+client. Same MSBT look, new data path.
+
+### Added
+- **Solo Combat Feed engine**: every number displayed comes from a signal that
+  can only describe the player - `UNIT_SPELLCAST_*` on the player (casts),
+  `UNIT_COMBAT` on the player (incoming damage, misses, self-heals) and
+  `UNIT_COMBAT` on the target **solo only**. In groups the GUID-keyed
+  `C_DamageMeter` per-spell totals are the ONLY dealt-damage/healing source;
+  entries that cannot be unwrapped (Secret Values mid-combat) are skipped, so
+  the feed shows your damage or nothing - never anyone else's.
+- **Per-spell classifier with sustained grouping**: a hit landing within 1.2s
+  of its cast shows immediately (direct hit); hits of the same spell arriving
+  at melee cadence (multi-hit specials) keep showing directly; hits that
+  space out (DoT ticks, slow weapon procs) switch to sustained mode and
+  render as one grouped line `Spell (hits) total`, flushed after 3.5s of
+  quiet or at combat end. A recast closes the open group first so no total is
+  lost.
+- **Independent weapon hits**: unattributed wounds (weapon swings, procs)
+  render as classic plain melee numbers, independent of any spell.
+- **Live overheal estimate**: a double-buffered `UNIT_HEALTH` ledger estimates
+  how much of each self-heal exceeded max health, rendered through
+  FormatEvent's existing overheal trailer. In groups the meter's
+  `overkillAmount` delta is used instead.
+- **Self-heals solo**: a heal landing on the player is shown as the player's
+  own outgoing heal (attributed to the cast just finished); the cast is marked
+  as a heal so it can never attribute damage later. In groups heals are not
+  shown from UNIT_COMBAT (caster unknowable) - the meter covers dealt healing.
+- **Channelled spells** always count as sustained damage (their ticks group
+  instead of popping per tick).
+- **Regrouping mid-combat** closes open sustained groups before switching the
+  dealt-damage authority (solo `UNIT_COMBAT` <-> group meter).
+
+### Changed
+- The damage meter is no longer polled solo (UNIT_COMBAT is authoritative and
+  richer there), eliminating every double-display scenario.
+- Diagnostics: mid-combat meter sampling now accumulates across fights with
+  fight-start markers; `DebugMeterInfo()` merges (never overwrites) samples.
+
+### Removed
+- The v1.4 stand-down flags (`unitCombatOutgoingSeen`/`unitCombatHealSeen`)
+  and the meter's aggregated pending-event buffer - replaced by the shared
+  classifier/accumulator.
+
 ## [1.4.2] - 2026-11-11
 
 ### Fixed
