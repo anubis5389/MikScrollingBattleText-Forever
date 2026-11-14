@@ -3,6 +3,33 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.1] - 2026-11-15
+
+### Fixed
+- **No outgoing damage displayed during combat (v1.5.0)**: the classifier
+  buffered into a sustained group every hit whose cast was 1.2-4s old, and
+  every following hit refreshed that group - which never went idle for
+  SUSTAINED_IDLE_FLUSH during an ongoing fight, so nothing showed until
+  combat end. The classifier is now **show-by-default**: direct hits,
+  melee-cadence multi-hits and one-off hits all display immediately. Only a
+  spell that demonstrated DoT-like behaviour (2+ hits spaced beyond the melee
+  cadence) groups its FUTURE hits; already-shown hits stay on screen.
+- **Meter deltas (group mode) could also sit buffered until combat end**:
+  meter-fed pending amounts now flush by age - one aggregated line per spell
+  per second - instead of relying on the idle window.
+- **Tick attribution now uses the damage school as evidence**: a wound is
+  attributed to a single spell with recent hits only when the school matches
+  (a fire wound cannot be a weapon swing); school mismatches and ambiguous
+  candidates fall through to the (immediate) old-cast rule or to plain melee
+  numbers - visible over perfectly attributed.
+
+### Added
+- **Solo feed decision log**: every wound/heal's attribution decision and
+  display choice (fresh-cast show, cadence show, first show, spaced show,
+  sustained switch, buffer, flush) is recorded (capped, per-fight markers)
+  into `MSBT_DebugDiagnostics`, merged by `DebugMeterInfo()` - a test can now
+  be verified from the SavedVariables dump without guessing.
+
 ## [1.5.0] - 2026-11-15
 
 Complete redesign of the damage/healing pipeline ("Solo Combat Feed") after

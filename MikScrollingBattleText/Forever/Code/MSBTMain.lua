@@ -1844,49 +1844,77 @@ local DIRECT_HIT_SPACING = 1.0
 -- longest DoT tick interval (3s in Classic) or ticking spells would flush
 -- every tick.
 local SUSTAINED_IDLE_FLUSH = 3.5
--- Attribution windows for solo UNIT_COMBAT wounds/heals. The heal window is
--- short because a heal event always fires right when its cast completes -
--- and a HoT tick arriving later must not mark an unrelated fresh damage cast
--- as a heal.
+-- A spell switches to sustained (grouped) mode only after this many of its
+-- hits arrived spaced beyond DIRECT_HIT_SPACING - evidence of DoT-like
+-- behaviour. Until then every attributed hit SHOWS: never withhold a number
+-- on a guess.
+local SUSTAINED_SPACED_HITS = 2
+-- How long a spell's last hit keeps it a candidate for "its next tick" when
+-- no cast is in reach (rule 2 below). Must comfortably exceed a DoT tick
+-- interval so mid-fight ticks still attribute.
+local TICK_TRACKING_WINDOW = 7.0
+-- Solo attribution windows. The heal window is short because a heal event
+-- always fires right when its cast completes - and a HoT tick arriving later
+-- must not mark an unrelated fresh damage cast as a heal.
 local WOUND_ATTRIBUTION_WINDOW = 4.0
 local HEAL_ATTRIBUTION_WINDOW = 1.0
 
--- Meter poll cadence and its type constants.
+-- Meter poll cadence, type constants, and the pending-flush age: meter deltas
+-- aggregate per spell and flush as one line per second instead of one
+-- fragment per 0.5s poll.
 local METER_POLL_INTERVAL = 0.5
+local METER_PENDING_FLUSH = 1.0
 local DM_DAMAGEDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.DamageDone) or 0
 local DM_HEALINGDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.HealingDone) or 2
 
--- Per-spell hit/heal state: { mode = "direct"|"sustained", lastTime, ... }.
+-- Per-spell state: { mode = "direct"|"sustained", lastTime, spacedHits,
+-- school, amount, hits, overheal, pendingSince }. Direct mode shows every
+-- attributed hit; sustained mode groups them. pendingSince is set only for
+-- meter-fed pending amounts (flushed by age); solo sustained groups flush on
+-- idle instead.
 local hitStates, healStates = {}, {}
 local damageMeterLastTotals = {}
 local damageMeterLastOverkills = {}
 local damageMeterTicker
 
+-- Decision log (diagnostics): records how each wound/heal was attributed and
+-- displayed so a test can be verified from the SavedVariables dump. Capped.
+local decisionLog = {}
+local function LogDecision(text)
+	decisionLog[#decisionLog + 1] = string_format("%.1f %s", GetTime() % 10000, text)
+	if #decisionLog > 200 then table_remove(decisionLog, 1) end
+end
+
 -- Attributes a solo UNIT_COMBAT wound on the target to a spell (or nil for
--- the classic plain melee number):
+-- the classic plain melee number). damageType is the wound's school - the
+-- school is evidence: a fire wound cannot be a weapon swing.
 --   1. a fresh cast (within DIRECT_HIT_WINDOW): the wound is its direct hit
 --      or application tick - always that spell;
---   2. exactly one spell in sustained mode: the wound is its next tick
---      (multi-DoT fights are ambiguous and fall through);
---   3. an untracked last cast within the window: a late single hit;
+--   2. exactly one spell with recent hits whose school matches: the wound is
+--      its next tick (multi-spell or school-mismatch falls through, so a
+--      weapon swing during a fire DoT is never misattributed);
+--   3. an old cast within the window: likely that spell's hit (shown
+--      immediately, v1.4.2 behaviour);
 --   4. otherwise unattributed: plain melee number (weapon swings, procs).
-local function AttributeSoloWound(now)
+local function AttributeSoloWound(now, damageType)
 	-- 1. Fresh cast.
 	if lastCast.spellID and (now - lastCast.time) <= DIRECT_HIT_WINDOW and not playerHealSpellIDs[lastCast.spellID] then
 		return lastCast.spellID, lastCast.time
 	end
-	-- 2. A single sustained spell owns its ticks.
-	local active = nil
+	-- 2. A single spell with recent hits owns its ticks (school-matched).
+	local active, activeSchool, ambiguous
 	for spellID, state in pairs(hitStates) do
-		if state.mode == "sustained" then
-			if active then active = nil break end
-			active = spellID
+		if (now - state.lastTime) <= TICK_TRACKING_WINDOW then
+			if active then ambiguous = true break end
+			active, activeSchool = spellID, state.school
 		end
 	end
-	if active then return active, recentCasts[active] end
-	-- 3. An untracked last cast (late single hit).
+	if not ambiguous and active and damageType ~= nil and activeSchool ~= nil and damageType == activeSchool then
+		return active, nil
+	end
+	-- 3. An old cast within the wound window.
 	if lastCast.spellID and (now - lastCast.time) <= WOUND_ATTRIBUTION_WINDOW
-		and not playerHealSpellIDs[lastCast.spellID] and hitStates[lastCast.spellID] == nil then
+		and not playerHealSpellIDs[lastCast.spellID] then
 		return lastCast.spellID, lastCast.time
 	end
 	-- 4. Unattributed.
@@ -1896,7 +1924,8 @@ end
 -- ****************************************************************************
 -- Flushes one sustained group as a single MSBT event: "<Spell> (<hits>)
 -- <total>" (plus the accumulated overheal for heals). Called when the spell
--- has been quiet for SUSTAINED_IDLE_FLUSH seconds or at combat end.
+-- has been quiet for SUSTAINED_IDLE_FLUSH seconds, when its meter-pending
+-- amount is METER_PENDING_FLUSH seconds old, or at combat end.
 -- ****************************************************************************
 local function FlushSustained(states, spellID, eventType)
 	local state = states[spellID]
@@ -1914,6 +1943,7 @@ local function FlushSustained(states, spellID, eventType)
 		event.recipientName = NonSecret(UnitName("player"))
 		if (state.overheal or 0) > 0 then event.overhealAmount = state.overheal end
 	end
+	LogDecision("flush " .. SafeText(spellID) .. " " .. eventType .. " hits=" .. SafeText(state.hits) .. " total=" .. SafeText(state.amount))
 	ParserEventsHandler(event)
 	states[spellID] = nil
 end
@@ -1930,66 +1960,132 @@ local function EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
 		isCrit = isCrit, damageType = damageType, skillID = spellID, skillName = spellName})
 end
 
--- ****************************************************************************
+--*****************************************************************************
 -- Feeds one of the player's outgoing hits (a solo UNIT_COMBAT wound or a
--- group meter delta) into the shared classifier. Direct hits and multi-hit
--- cadences display immediately; spaced-out hits switch the spell to sustained
--- mode and group into one line (flushed on idle or combat end, see
--- FlushSustained and PollDamageMeter). Secret amounts can't be accumulated -
--- they display immediately instead.
--- ****************************************************************************
-local function FeedOwnHit(spellID, spellName, amount, isCrit, damageType, castTime)
+-- group meter delta) into the shared classifier. SHOW BY DEFAULT: direct
+-- hits, melee-cadence multi-hits and one-off hits all display immediately.
+-- Only a spell that demonstrated DoT-like behaviour (SUSTAINED_SPACED_HITS
+-- hits spaced beyond the melee cadence) switches to sustained mode, and that
+-- affects only its FUTURE hits - the already-shown ones stay on screen.
+-- Meter deltas (aggregated totals, no per-hit detail) always buffer per
+-- spell and flush once per second (readable, never dropped).
+--***************************************************************************
+local function FeedOwnHit(spellID, spellName, amount, isCrit, damageType, castTime, isMeterDelta)
 	if amount == nil then return end
 
-	-- Weapon swing / unattributed hit.
+	-- Weapon swing / unattributed hit: the classic plain melee number.
 	if spellID == nil then
+		LogDecision("wound nil -> plain show")
 		EmitOwnHitNow(nil, nil, amount, isCrit, damageType)
 		return
 	end
 
 	local now = GetTime()
 	local state = hitStates[spellID]
+	local secretAmount = issecretvalue and issecretvalue(amount)
 
 	-- A fresh cast is always the spell's direct hit (channelled spells count
 	-- as sustained from the start). A recast closes any open sustained group
 	-- of the same spell first, so its accumulated total is not lost.
-	if castTime and (now - castTime) <= DIRECT_HIT_WINDOW and not channelledSpells[spellID] then
+	if castTime and not secretAmount and (now - castTime) <= DIRECT_HIT_WINDOW and not channelledSpells[spellID] then
 		if state and state.mode == "sustained" then FlushSustained(hitStates, spellID, "damage") end
-		hitStates[spellID] = { mode = "direct", lastTime = now }
+		hitStates[spellID] = { mode = "direct", lastTime = now, spacedHits = 0, school = damageType }
+		LogDecision("hit " .. SafeText(spellID) .. " -> fresh-cast show")
 		EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
 		return
 	end
 
-	-- Melee-cadence follow-ups of a spell that already showed its direct hit.
+	-- Meter deltas: aggregate per spell, flush by age (see PollDamageMeter).
+	if isMeterDelta then
+		if state == nil or state.mode ~= "sustained" then
+			state = { mode = "sustained", amount = 0, hits = 0, lastTime = now, pendingSince = now }
+			hitStates[spellID] = state
+		end
+		if state.pendingSince == nil then state.pendingSince = now end
+		if secretAmount then
+			-- Secret amounts can't be accumulated: show the delta directly.
+			state.lastTime = now
+			LogDecision("hit " .. SafeText(spellID) .. " -> meter SECRET show")
+			EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
+			return
+		end
+		state.amount = state.amount + amount
+		state.hits = state.hits + 1
+		state.lastTime = now
+		LogDecision("hit " .. SafeText(spellID) .. " -> meter buffer total=" .. SafeText(state.amount))
+		return
+	end
+
+	-- Channelled spells always count as sustained damage: their ticks group.
+	if channelledSpells[spellID] then
+		if state == nil or state.mode ~= "sustained" then
+			state = { mode = "sustained", amount = 0, hits = 0, lastTime = now, school = damageType }
+			hitStates[spellID] = state
+		end
+		if secretAmount then
+			state.lastTime = now
+			LogDecision("hit " .. SafeText(spellID) .. " -> channelled SECRET show")
+			EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
+			return
+		end
+		state.amount = state.amount + amount
+		state.hits = state.hits + 1
+		state.lastTime = now
+		LogDecision("hit " .. SafeText(spellID) .. " -> channelled buffer total=" .. SafeText(state.amount))
+		return
+	end
+
+	-- Melee-cadence follow-up of a spell that already shows individually.
 	if state and state.mode == "direct" and (now - state.lastTime) <= DIRECT_HIT_SPACING then
 		state.lastTime = now
+		LogDecision("hit " .. SafeText(spellID) .. " -> cadence show")
 		EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
 		return
 	end
 
-	-- Sustained damage: group it.
-	if state == nil or state.mode ~= "sustained" then
-		state = { mode = "sustained", amount = 0, hits = 0, lastTime = now }
-		hitStates[spellID] = state
-	end
-	local okAdd = pcall(function() state.amount = state.amount + amount end)
-	if not okAdd then
-		-- Secret amounts can't be accumulated; show the hit immediately.
+	-- First hit of this spell: show it immediately (safety first).
+	if state == nil then
+		hitStates[spellID] = { mode = "direct", lastTime = now, spacedHits = 0, school = damageType }
+		LogDecision("hit " .. SafeText(spellID) .. " -> first show")
 		EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
 		return
 	end
+
+	if state.mode == "direct" then
+		-- A hit spaced beyond the melee cadence: count it. From the
+		-- SUSTAINED_SPACED_HITS-th spaced hit on, the spell groups (DoT-like).
+		state.spacedHits = state.spacedHits + 1
+		if state.spacedHits < SUSTAINED_SPACED_HITS then
+			state.lastTime = now
+			LogDecision("hit " .. SafeText(spellID) .. " -> spaced show (" .. SafeText(state.spacedHits) .. ")")
+			EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
+			return
+		end
+		state.mode = "sustained"
+		state.amount, state.hits = 0, 0
+		LogDecision("hit " .. SafeText(spellID) .. " -> sustained switch")
+	end
+
+	-- Sustained accumulation.
+	if secretAmount then
+		state.lastTime = now
+		LogDecision("hit " .. SafeText(spellID) .. " -> sustained SECRET show")
+		EmitOwnHitNow(spellID, spellName, amount, isCrit, damageType)
+		return
+	end
+	state.amount = state.amount + amount
 	state.hits = state.hits + 1
 	state.lastTime = now
+	LogDecision("hit " .. SafeText(spellID) .. " -> sustained buffer total=" .. SafeText(state.amount))
 end
 
--- ****************************************************************************
+--*****************************************************************************
 -- Feeds one of the player's outgoing heals (a solo self-heal via UNIT_COMBAT
--- or a group meter delta). Direct heals show immediately; sustained heals
--- (HoT ticks) group like damage. overhealAmount comes from PlayerOverheal
--- (solo estimate) or the meter's overkillAmount (groups); FormatEvent renders
--- it as the overheal trailer.
--- ****************************************************************************
-local function FeedOwnHeal(spellID, spellName, amount, isCrit, overhealAmount, castTime)
+-- or a group meter delta), with the same show-by-default rules as damage.
+-- overhealAmount comes from PlayerOverheal (solo estimate) or the meter's
+-- overkillAmount (groups); FormatEvent renders it as the overheal trailer.
+--***************************************************************************
+local function FeedOwnHeal(spellID, spellName, amount, isCrit, overhealAmount, castTime, isMeterDelta)
 	if amount == nil then return end
 
 	local function Emit()
@@ -2005,32 +2101,82 @@ local function FeedOwnHeal(spellID, spellName, amount, isCrit, overhealAmount, c
 	end
 
 	-- Unattributed heal (HoT tick with no cast in reach, potion): show it.
-	if spellID == nil then Emit() return end
+	if spellID == nil then
+		LogDecision("heal nil -> plain show")
+		Emit()
+		return
+	end
 
 	local now = GetTime()
 	local state = healStates[spellID]
+	local secretAmount = issecretvalue and issecretvalue(amount)
 
-	if castTime and (now - castTime) <= DIRECT_HIT_WINDOW then
+	if castTime and not secretAmount and (now - castTime) <= DIRECT_HIT_WINDOW then
 		if state and state.mode == "sustained" then FlushSustained(healStates, spellID, "heal") end
-		healStates[spellID] = { mode = "direct", lastTime = now }
+		healStates[spellID] = { mode = "direct", lastTime = now, spacedHits = 0 }
+		LogDecision("heal " .. SafeText(spellID) .. " -> fresh-cast show")
 		Emit()
 		return
 	end
+
+	if isMeterDelta then
+		if state == nil or state.mode ~= "sustained" then
+			state = { mode = "sustained", amount = 0, overheal = 0, hits = 0, lastTime = now, pendingSince = now }
+			healStates[spellID] = state
+		end
+		if state.pendingSince == nil then state.pendingSince = now end
+		if secretAmount then
+			state.lastTime = now
+			LogDecision("heal " .. SafeText(spellID) .. " -> meter SECRET show")
+			Emit()
+			return
+		end
+		state.amount = state.amount + amount
+		if overhealAmount then pcall(function() state.overheal = state.overheal + overhealAmount end) end
+		state.hits = state.hits + 1
+		state.lastTime = now
+		LogDecision("heal " .. SafeText(spellID) .. " -> meter buffer total=" .. SafeText(state.amount))
+		return
+	end
+
 	if state and state.mode == "direct" and (now - state.lastTime) <= DIRECT_HIT_SPACING then
 		state.lastTime = now
+		LogDecision("heal " .. SafeText(spellID) .. " -> cadence show")
 		Emit()
 		return
 	end
 
-	if state == nil or state.mode ~= "sustained" then
-		state = { mode = "sustained", amount = 0, overheal = 0, hits = 0, lastTime = now }
-		healStates[spellID] = state
+	if state == nil then
+		healStates[spellID] = { mode = "direct", lastTime = now, spacedHits = 0 }
+		LogDecision("heal " .. SafeText(spellID) .. " -> first show")
+		Emit()
+		return
 	end
-	local okAdd = pcall(function() state.amount = state.amount + amount end)
-	if not okAdd then Emit() return end
+
+	if state.mode == "direct" then
+		state.spacedHits = state.spacedHits + 1
+		if state.spacedHits < SUSTAINED_SPACED_HITS then
+			state.lastTime = now
+			LogDecision("heal " .. SafeText(spellID) .. " -> spaced show (" .. SafeText(state.spacedHits) .. ")")
+			Emit()
+			return
+		end
+		state.mode = "sustained"
+		state.amount, state.overheal, state.hits = 0, 0, 0
+		LogDecision("heal " .. SafeText(spellID) .. " -> sustained switch")
+	end
+
+	if secretAmount then
+		state.lastTime = now
+		LogDecision("heal " .. SafeText(spellID) .. " -> sustained SECRET show")
+		Emit()
+		return
+	end
+	state.amount = state.amount + amount
 	if overhealAmount then pcall(function() state.overheal = state.overheal + overhealAmount end) end
 	state.hits = state.hits + 1
 	state.lastTime = now
+	LogDecision("heal " .. SafeText(spellID) .. " -> sustained buffer total=" .. SafeText(state.amount))
 end
 
 -------------------------------------------------------------------------------
@@ -2086,9 +2232,9 @@ local function PollDamageMeterSource(damageMeterType, isHeal)
 						if overhealDelta < 0 then overhealDelta = overkillAmount end
 						damageMeterLastOverkills[key] = overkillAmount
 					end
-					FeedOwnHeal(spellID, spellName, delta, nil, overhealDelta, recentCasts[spellID])
+					FeedOwnHeal(spellID, spellName, delta, nil, overhealDelta, recentCasts[spellID], true)
 				else
-					FeedOwnHit(spellID, spellName, delta, nil, nil, recentCasts[spellID])
+					FeedOwnHit(spellID, spellName, delta, nil, nil, recentCasts[spellID], true)
 				end
 			end
 		end
@@ -2171,16 +2317,30 @@ local function PollDamageMeter()
 		PollDamageMeterSource(DM_HEALINGDONE, true)
 	end
 
-	-- Flush sustained spells that have gone quiet.
+	-- Flush sustained spells: meter-fed pending amounts flush by age (one
+	-- aggregated line per spell per second); solo sustained groups (DoTs)
+	-- flush after SUSTAINED_IDLE_FLUSH of quiet.
 	local now = GetTime()
 	for spellID, state in pairs(hitStates) do
-		if state.mode == "sustained" and (now - state.lastTime) >= SUSTAINED_IDLE_FLUSH then
-			FlushSustained(hitStates, spellID, "damage")
+		if state.mode == "sustained" then
+			if state.pendingSince ~= nil then
+				if (now - state.pendingSince) >= METER_PENDING_FLUSH then
+					FlushSustained(hitStates, spellID, "damage")
+				end
+			elseif (now - state.lastTime) >= SUSTAINED_IDLE_FLUSH then
+				FlushSustained(hitStates, spellID, "damage")
+			end
 		end
 	end
 	for spellID, state in pairs(healStates) do
-		if state.mode == "sustained" and (now - state.lastTime) >= SUSTAINED_IDLE_FLUSH then
-			FlushSustained(healStates, spellID, "heal")
+		if state.mode == "sustained" then
+			if state.pendingSince ~= nil then
+				if (now - state.pendingSince) >= METER_PENDING_FLUSH then
+					FlushSustained(healStates, spellID, "heal")
+				end
+			elseif (now - state.lastTime) >= SUSTAINED_IDLE_FLUSH then
+				FlushSustained(healStates, spellID, "heal")
+			end
 		end
 	end
 
@@ -2216,6 +2376,10 @@ local function SaveMeterDiagnostics(lines)
 	for _, line in ipairs(combatMeterSampleLines) do merged[#merged + 1] = line end
 	merged[#merged + 1] = "=== manual /run capture " .. date("%H:%M:%S") .. " ==="
 	for _, line in ipairs(lines) do merged[#merged + 1] = line end
+	if #decisionLog > 0 then
+		merged[#merged + 1] = "=== solo feed decisions (how each wound/heal was attributed and shown) ==="
+		for _, line in ipairs(decisionLog) do merged[#merged + 1] = line end
+	end
 	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = merged }
 end
 
@@ -2294,6 +2458,8 @@ local function StartCombatFeed()
 	lastMeterSampleTime = 0
 	meterCombatStartTime = GetTime()
 	combatMeterSampleLines[#combatMeterSampleLines + 1] = "--- fight start ---"
+	decisionLog[#decisionLog + 1] = "--- fight start ---"
+	while #decisionLog > 200 do table_remove(decisionLog, 1) end
 
 	damageMeterTicker = C_Timer.NewTicker(METER_POLL_INTERVAL, PollDamageMeter)
 end
@@ -2393,17 +2559,25 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 	if unitTarget == "target" then
 		if outgoingLogSeen or not InCombatLockdown() or IsInGroup() then return end
 
+		-- schoolMask shares the numeric domain with the old combat log damage
+		-- schools, so it can color the amount and acts as evidence in tick
+		-- attribution (a fire school wound cannot be a weapon swing), so it is
+		-- computed before attribution.
+		local damageType = (schoolMask and not (issecretvalue and issecretvalue(schoolMask))) and schoolMask or nil
+
 		if isWound then
 			local now = GetTime()
-			local spellID, castTime = AttributeSoloWound(now)
+			local spellID, castTime = AttributeSoloWound(now, damageType)
+			LogDecision("wound amt=" .. SafeText(amount) .. " school=" .. SafeText(damageType)
+				.. " -> spell=" .. SafeText(spellID)
+				.. (castTime and (" castAge=" .. string_format("%.1f", now - castTime)) or ""))
 			local spellName = spellID and NonSecret(GetSpellInfo(spellID)) or nil
-			-- schoolMask shares the numeric domain with the old combat log
-			-- damage schools, so it can color the amount directly.
-			local damageType = (schoolMask and not (issecretvalue and issecretvalue(schoolMask))) and schoolMask or nil
-			FeedOwnHit(spellID, spellName, amount, isCrit, damageType, castTime)
+			FeedOwnHit(spellID, spellName, amount, isCrit, damageType, castTime, false)
 		else
 			-- Outgoing miss (solo), attributed like a wound when possible.
-			local spellID = AttributeSoloWound(GetTime())
+			local now = GetTime()
+			local spellID, castTime = AttributeSoloWound(now, nil)
+			LogDecision("miss " .. SafeText(action) .. " -> spell=" .. SafeText(spellID))
 			ParserEventsHandler({eventType = "miss", sourceUnit = "player", missType = action,
 				recipientName = NonSecret(UnitName("target")),
 				skillID = spellID, skillName = spellID and NonSecret(GetSpellInfo(spellID)) or nil})
@@ -2436,7 +2610,8 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 			playerHealSpellIDs[spellID] = true
 		end
 		local spellName = spellID and NonSecret(GetSpellInfo(spellID)) or nil
-		FeedOwnHeal(spellID, spellName, amount, isCrit or action == "HEAL_CRIT", PlayerOverheal(amount), castTime)
+		LogDecision("heal-on-player amt=" .. SafeText(amount) .. " -> spell=" .. SafeText(spellID))
+		FeedOwnHeal(spellID, spellName, amount, isCrit or action == "HEAL_CRIT", PlayerOverheal(amount), castTime, false)
 	end
 end
 
