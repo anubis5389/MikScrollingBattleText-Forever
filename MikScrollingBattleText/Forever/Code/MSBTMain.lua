@@ -2620,6 +2620,23 @@ end
 -------------------------------------------------------------------------------
 -- §8 UNIT_COMBAT router: the Solo Combat Feed's raw signal source.
 -------------------------------------------------------------------------------
+
+-- True while the player's melee auto-attack toggle is engaged (spell 6603,
+-- "Attack"). This is the game's own switch for the white swings - an old,
+-- non-secret API the meter itself keys white damage under. Unknown APIs err
+-- on the visible side (true).
+local function PlayerAutoAttacking()
+	if C_Spell and C_Spell.IsCurrentSpell then
+		local ok, res = pcall(C_Spell.IsCurrentSpell, 6603)
+		if ok and res ~= nil then return res and true or false end
+	end
+	if IsCurrentSpell then
+		local ok, res = pcall(IsCurrentSpell, 6603)
+		if ok and res ~= nil then return res and true or false end
+	end
+	return true
+end
+
 -- The combat log delivers nothing usable on Forever, so the player's combat
 -- story is routed from UNIT_COMBAT: wounds/misses on the target (SOLO only -
 -- inside a group they cannot be attributed and are dropped, because a party
@@ -2655,11 +2672,12 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 	-- hardened to handle them safely.
 	if isWound and amount ~= nil and not (issecretvalue and issecretvalue(amount)) and amount <= 0 then return end
 
-	-- Outgoing hits (wounds and misses) - SOLO ONLY. Inside a group this
-	-- branch drops everything: UNIT_COMBAT on the target cannot say who
-	-- swung, and the meter feed (§4) is the dealt-damage authority there.
-	-- Solo, UNIT_COMBAT is authoritative and richer (per-hit amounts, crits,
-	-- damage schools), so the meter is not even polled (see PollDamageMeter).
+	-- Outgoing hits (wounds and misses) on the player's target. Solo, all of
+	-- them are the player's; in a group, only what the game's own signals
+	-- tie to the player: fresh casts, cadence and school-matched ticks
+	-- (schooled wounds), the auto-attack toggle (white swings), and
+	-- EXTRA_ATTACKS. Incoming direction below is always the player's own
+	-- data - in groups too.
 	if unitTarget == "target" then
 		if outgoingLogSeen or not InCombatLockdown() then return end
 
@@ -2671,15 +2689,37 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 
 		local now = GetTime()
 		local inGroup = IsInGroup()
-		-- In a group, a wound on the target cannot name the attacker. Show
-		-- only what can be tied to the player by the game's own signals: a
-		-- fresh cast, a cadence follow-up, a school-matched tick of the one
-		-- spell with recent hits, or the swings the game itself flagged as
-		-- the player's extra attacks. Everything else is dropped - it is
-		-- somebody else's hit until proven otherwise.
+
+		-- School-less wounds are plain weapon swings: the game's own meter
+		-- keys them under spell 6603 ("Attack"), and UNIT_COMBAT carries no
+		-- school for them. They must never steal a spell's name (the fresh
+		-- cast rule would happily eat them - the v1.6.0 dump showed white
+		-- swings entering a Stormstrike group), so they bypass spell
+		-- attribution entirely and show as the classic plain melee number.
+		-- Solo everything is the player's anyway; in a group they only show
+		-- while the player's own auto-attack is engaged or during the game's
+		-- extra-attack window. MSBT's swing merge folds repeats into
+		-- "[N hits]" lines, so density stays readable.
+		if isWound and damageType == nil then
+			if not inGroup or now <= extraAttackUntil or PlayerAutoAttacking() then
+				LogDecision("wound amt=" .. SafeText(amount) .. " school=nil -> plain white swing show")
+				FeedOwnHit(nil, nil, amount, isCrit, nil, nil, false)
+			else
+				LogDecision("wound amt=" .. SafeText(amount) .. " school=nil -> dropped (group, not auto-attacking)")
+			end
+			return
+		end
+
+		-- In a group, a schooled wound on the target cannot name the
+		-- attacker with certainty. Show only what can be tied to the player
+		-- by the game's own signals: a fresh cast, a cadence follow-up, a
+		-- school-matched tick of the one spell with recent hits, or the
+		-- swings the game itself flagged as the player's extra attacks.
+		-- Everything else is dropped - it is somebody else's hit until
+		-- proven otherwise.
 		local spellID, castTime = AttributeSoloWound(now, damageType, inGroup)
 		if inGroup and spellID == nil and now > extraAttackUntil then
-			LogDecision("wound amt=" .. SafeText(amount) .. " -> dropped (group, unattributable)")
+			LogDecision("wound amt=" .. SafeText(amount) .. " school=" .. SafeText(damageType) .. " -> dropped (group, unattributable)")
 			return
 		end
 		if isWound then

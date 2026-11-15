@@ -3,6 +3,30 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] - 2026-11-15
+
+### Fixed
+- **White melee damage (auto-attack) never showed in groups** (only spell
+  hits after casting): the v1.6.0 dump proved the group rule dropped every
+  school-less wound - and school-less wounds ARE the white swings (the game's
+  own meter keys them under spell 6603, "Attack"; the post-fight dump showed
+  the player's auto-attack as their biggest damage source with zero numbers
+  displayed). Worse, white swings landing within 1.2s of a cast were
+  misattributed to that cast's spell and could enter its sustained group.
+
+### Changed
+- **School-less wounds bypass spell attribution entirely** and display as
+  the classic plain MSBT melee number - in groups and solo alike. In a group
+  they show while the player's own auto-attack toggle is engaged
+  (`IsCurrentSpell(6603)`, the game's own switch for white swings) or during
+  the game's `EXTRA_ATTACKS` window; otherwise they are dropped (not
+  auto-attacking). MSBT's swing merge folds repeats into `[N hits]` lines so
+  density stays readable. Note: no accessible feed can name the attacker of
+  a white swing, so other melee players' auto-swings on your target are part
+  of that stream - that is exactly how the game's own nameplate addons work.
+- Schooled wounds keep the strict group attribution (fresh cast, cadence,
+  school-matched tick, extra attacks); solo behaviour is unchanged.
+
 ## [1.6.0] - 2026-11-15
 
 ### Added

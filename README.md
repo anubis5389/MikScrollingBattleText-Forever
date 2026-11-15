@@ -98,8 +98,11 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
     swings extra que el juego marca como tuyos (`EXTRA_ATTACKS`).
   - `UNIT_COMBAT` sobre `"target"` — heridas del target ligadas al jugador por
     correlación estricta: cast fresco, cadencia, tick con escuela coincidente
-    o swings extra marcados. En solitario la correlación es más laxa (todo es
-    tuyo o de tu mascota); en grupo, lo no atribuible se descarta.
+    o swings extra marcados. **Los swings blancos (heridas sin escuela) se
+    muestran siempre como el número melee clásico** mientras tu toggle de
+    auto-ataque (`IsCurrentSpell(6603)`) esté activo — en solitario y en
+    grupo; los hechizos jamás les roban el nombre. En grupo, lo no atribuible
+    se descarta.
   - `C_DamageMeter` — **solo en grupo**, totales por hechizo keyados por tu
     GUID: la única fuente de daño/curación infringida atribuible a ti en
     grupo. Las entradas que no se pueden desenvolver (Secret Values en pleno
