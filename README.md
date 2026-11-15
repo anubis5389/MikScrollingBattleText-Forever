@@ -32,6 +32,23 @@ Este fork combina dos líneas de desarrollo:
 
 ### Cambios propios de este fork
 
+**v1.6.0 — "Game's Own Feed" (feed del propio juego)**:
+
+1. **`COMBAT_TEXT_UPDATE` + `C_CombatText.SetActiveUnit("player")`**: el addon
+   adopta la fuente de datos del texto de combate nativo de Blizzard, disponible
+   en Forever. Es el único feed sancionado que **nombra al sanador** de una cura
+   recibida — las curas de otros jugadores sobre ti se muestran ahora con el
+   nombre de quien te curó (`+X [Sanador]`), y tus autocuraciones se atribuyen
+   al cast recién terminado.
+2. **Modo grupo con correlación estricta** (sustituye el descarte total de
+   v1.5.x): en grupo, una herida del target solo se muestra si está ligada a ti
+   — cast fresco, cadencia melee del hechizo, tick con escuela coincidente del
+   único hechizo con golpes recientes, o los swings extra (`EXTRA_ATTACKS`,
+   p. ej. Windfury) que el propio juego marca como tuyos. El resto se descarta:
+   es de otro hasta que se demuestre lo contrario.
+3. **Debounce cruzado** entre el feed del juego y `UNIT_COMBAT`: una cura nunca
+   se muestra dos veces.
+
 **v1.5.0 — motor "Solo Combat Feed"** (rediseño completo del pipeline de daño y
 curación tras los motores medidor-only de v1.3/v1.4):
 
@@ -74,8 +91,15 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
     golpes y de curas).
   - `UNIT_COMBAT` sobre `"player"` — daño, fallos y curas que te **llegan** (el
     receptor eres tú, en solitario y en grupo).
-  - `UNIT_COMBAT` sobre `"target"` — **solo en solitario**: fuera de grupo,
-    toda herida del target es tuya (o de tu mascota).
+  - `COMBAT_TEXT_UPDATE` con `C_CombatText.SetActiveUnit("player")` — el feed
+    del texto de combate nativo de Blizzard, sobre ti: curas recibidas **con el
+    nombre del sanador** (autoridad de curas en todos los modos; la rama de
+    curas de `UNIT_COMBAT` queda como fallback solitario con debounce), y los
+    swings extra que el juego marca como tuyos (`EXTRA_ATTACKS`).
+  - `UNIT_COMBAT` sobre `"target"` — heridas del target ligadas al jugador por
+    correlación estricta: cast fresco, cadencia, tick con escuela coincidente
+    o swings extra marcados. En solitario la correlación es más laxa (todo es
+    tuyo o de tu mascota); en grupo, lo no atribuible se descarta.
   - `C_DamageMeter` — **solo en grupo**, totales por hechizo keyados por tu
     GUID: la única fuente de daño/curación infringida atribuible a ti en
     grupo. Las entradas que no se pueden desenvolver (Secret Values en pleno
@@ -92,17 +116,17 @@ El cliente Forever ejecuta contenido Classic, pero su motor es el de Midnight 12
 
 ### Limitaciones conocidas (por diseño de la API de Forever)
 
-- **En grupo, sin detalle por golpe**: el daño/curación infringidos provienen
-  exclusivamente del medidor `C_DamageMeter` (deltas de totales por hechizo
-  cada 0.5 s; sin críticos ni escuelas, con conteo de golpes estimado), porque
-  `UNIT_COMBAT` sobre el target no permite saber quién golpeó. Si el medidor no
-  entrega en pleno combate (Secret Values), en grupo se muestra **nada** antes
-  que un dato mal atribuido.
+- **En grupo, sin detalle por golpe en el daño infringido**: el daño/curación
+  infringidos provienen de la correlación de tus casts con las heridas del
+  target (cast fresco, cadencia, tick con escuela coincidente, swings extra
+  marcados por el juego) y, como red futura, de los deltas del medidor
+  `C_DamageMeter` (sin críticos ni escuelas). Lo no atribuible a ti se
+  descarta: es de otro hasta que se demuestre lo contrario.
 - **En solitario, todo con detalle por golpe** (`UNIT_COMBAT`): críticos,
   escuelas de daño y overheal en vivo; el medidor ni siquiera se consulta.
-- Las curaciones de otros jugadores sobre ti no se muestran (no se pueden
-  atribuir a un caster, y mostrarlas duplicaría tu propia línea de cura en
-  grupo).
+- Las curaciones de otros jugadores sobre ti **se muestran con el nombre del
+  sanador** (vía `COMBAT_TEXT_UPDATE`, el mismo dato que usa el texto de
+  combate nativo); en grupo y en solitario por igual.
 - Los triggers que dependían de subeventos del combat log (p. ej. detectar el
   hechizo exacto de un proc) no disponen de ese feed; el resto de triggers
   funciona.

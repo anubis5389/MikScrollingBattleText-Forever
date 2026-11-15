@@ -1887,16 +1887,18 @@ end
 
 -- Attributes a solo UNIT_COMBAT wound on the target to a spell (or nil for
 -- the classic plain melee number). damageType is the wound's school - the
--- school is evidence: a fire wound cannot be a weapon swing.
+-- school is evidence: a fire wound cannot be a weapon swing. In strict mode
+-- (groups) the weaker "old cast" rule is skipped: a hit 2s after a cast may
+-- belong to anyone.
 --   1. a fresh cast (within DIRECT_HIT_WINDOW): the wound is its direct hit
 --      or application tick - always that spell;
 --   2. exactly one spell with recent hits whose school matches: the wound is
 --      its next tick (multi-spell or school-mismatch falls through, so a
 --      weapon swing during a fire DoT is never misattributed);
---   3. an old cast within the window: likely that spell's hit (shown
---      immediately, v1.4.2 behaviour);
+--   3. an old cast within the window (SOLO only): likely that spell's hit
+--      (shown immediately);
 --   4. otherwise unattributed: plain melee number (weapon swings, procs).
-local function AttributeSoloWound(now, damageType)
+local function AttributeSoloWound(now, damageType, strict)
 	-- 1. Fresh cast.
 	if lastCast.spellID and (now - lastCast.time) <= DIRECT_HIT_WINDOW and not playerHealSpellIDs[lastCast.spellID] then
 		return lastCast.spellID, lastCast.time
@@ -1912,8 +1914,9 @@ local function AttributeSoloWound(now, damageType)
 	if not ambiguous and active and damageType ~= nil and activeSchool ~= nil and damageType == activeSchool then
 		return active, nil
 	end
-	-- 3. An old cast within the wound window.
-	if lastCast.spellID and (now - lastCast.time) <= WOUND_ATTRIBUTION_WINDOW
+	-- 3. An old cast within the wound window (SOLO only - in a group a hit
+	--    arriving 2s after a cast may belong to anyone).
+	if not strict and lastCast.spellID and (now - lastCast.time) <= WOUND_ATTRIBUTION_WINDOW
 		and not playerHealSpellIDs[lastCast.spellID] then
 		return lastCast.spellID, lastCast.time
 	end
@@ -2514,6 +2517,107 @@ end
 
 
 -------------------------------------------------------------------------------
+-- §7 COMBAT_TEXT_UPDATE: the game's own floating-combat-text feed.
+-------------------------------------------------------------------------------
+-- This is the data source of Blizzard's native combat text: events about the
+-- unit set with C_CombatText.SetActiveUnit("player"). Per payload type, the
+-- heal family carries (sourceName, amount) - the ONLY sanctioned feed that
+-- names the caster of a heal - so it is the heal-on-player authority in all
+-- modes; the UNIT_COMBAT heal branch stays as a solo fallback with a cross
+-- debounce. EXTRA_ATTACKS flags Windfury-style extra swings as the player's
+-- own. Values may be Blizzard secret values mid-combat ("SecretReturns",
+-- patch 12.0); every event is logged to the decision log so a test dump
+-- shows exactly what the game's feed delivered and how secret it was.
+-- Payload table (warcraft.wiki.gg): DAMAGE/DAMAGE_CRIT amount; SPELL_DAMAGE
+-- amount; HEAL/HEAL_CRIT/PERIODIC_HEAL(_CRIT)(_ABSORB) sourceName + amount;
+-- BLOCK/ABSORB damage_taken + blocked/absorbed; MISS/DODGE/PARRY/... nil.
+--***************************************************************************
+
+local combatTextHealTypes = {
+	HEAL = true, HEAL_CRIT = true, HEAL_ABSORB = true, HEAL_CRIT_ABSORB = true,
+	PERIODIC_HEAL = true, PERIODIC_HEAL_CRIT = true, PERIODIC_HEAL_ABSORB = true,
+}
+
+local unitCombatHealSeenAt, combatTextHealSeenAt = 0, 0
+local extraAttackUntil = 0
+
+local function combatTextAvailable()
+	return C_CombatText and C_CombatText.SetActiveUnit and C_CombatText.GetCurrentEventInfo and true or false
+end
+
+function eventFrame:COMBAT_TEXT_UPDATE(messageType)
+	if not messageType or (issecretvalue and issecretvalue(messageType)) then return end
+
+	if messageType == "EXTRA_ATTACKS" then
+		-- The game flags the player's own upcoming extra swings (Windfury
+		-- weapon, etc.): wounds on the target within the next moments may be
+		-- shown as plain swings even in groups.
+		extraAttackUntil = GetTime() + 1.5
+		LogDecision("ctu EXTRA_ATTACKS -> own extra swings flagged")
+		return
+	end
+	if not combatTextHealTypes[messageType] then
+		-- Incoming damage types etc. are the UNIT_COMBAT player branch's
+		-- authority; log the type as feed evidence.
+		LogDecision("ctu " .. SafeText(messageType))
+		return
+	end
+
+	-- Heal family: desc1 = source name, desc2 = amount (desc3 = absorbed
+	-- amount on *_ABSORB types). May be secret mid-combat.
+	local ok, sourceName, amount, absorbed = pcall(C_CombatText.GetCurrentEventInfo)
+	if not ok then
+		LogDecision("ctu-heal " .. SafeText(messageType) .. " -> GetCurrentEventInfo FAILED")
+		return
+	end
+	local nameSecret = sourceName ~= nil and issecretvalue ~= nil and issecretvalue(sourceName) or false
+	local amountSecret = amount ~= nil and issecretvalue ~= nil and issecretvalue(amount) or false
+	combatTextHealSeenAt = GetTime()
+	LogDecision("ctu-heal " .. SafeText(messageType) .. " src=" .. SafeText(sourceName)
+		.. " srcSecret=" .. tostring(nameSecret) .. " amtSecret=" .. tostring(amountSecret))
+
+	if unitCombatHealSeenAt > 0 and (GetTime() - unitCombatHealSeenAt) < 0.5 then
+		LogDecision("ctu-heal -> dropped (UNIT_COMBAT delivered it first)")
+		return
+	end
+
+	local isHoT = string_find(messageType, "PERIODIC", 1, true) ~= nil
+	local isCrit = string_find(messageType, "CRIT", 1, true) ~= nil
+	local ownName = NonSecret(UnitName("player"))
+
+	-- The game's own rule: show who healed. A plain source name equal to the
+	-- player is the player's own heal.
+	if sourceName ~= nil and not nameSecret and ownName ~= nil and sourceName == ownName then
+		-- Self-heal: attribute to the cast that just finished (and mark it a
+		-- heal so it can never attribute damage later).
+		local spellID, castTime
+		local now = GetTime()
+		if lastCast.spellID and (now - lastCast.time) <= HEAL_ATTRIBUTION_WINDOW then
+			spellID, castTime = lastCast.spellID, lastCast.time
+			playerHealSpellIDs[spellID] = true
+		end
+		local spellName = spellID and NonSecret(GetSpellInfo(spellID)) or nil
+		LogDecision("ctu-heal -> SELF show spell=" .. SafeText(spellID))
+		FeedOwnHeal(spellID, spellName, amount, isCrit, PlayerOverheal(amount), castTime, false)
+		return
+	end
+
+	-- A heal from somebody else on the player: the user's own healing
+	-- received, shown with the healer's name when it is a plain string (that
+	-- is exactly what the native combat text shows). A secret source name
+	-- cannot be attributed - shown unattributed rather than guessed.
+	local event = {eventType = "heal", recipientUnit = "player", recipientName = ownName,
+		amount = amount, isCrit = isCrit, isHoT = isHoT}
+	if absorbed ~= nil and not (issecretvalue and issecretvalue(absorbed)) then
+		event.overhealAmount = absorbed
+	end
+	if sourceName ~= nil and not nameSecret then event.sourceName = sourceName end
+	LogDecision("ctu-heal -> incoming show src=" .. SafeText(sourceName))
+	ParserEventsHandler(event)
+end
+
+
+-------------------------------------------------------------------------------
 -- §8 UNIT_COMBAT router: the Solo Combat Feed's raw signal source.
 -------------------------------------------------------------------------------
 -- The combat log delivers nothing usable on Forever, so the player's combat
@@ -2557,7 +2661,7 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 	-- Solo, UNIT_COMBAT is authoritative and richer (per-hit amounts, crits,
 	-- damage schools), so the meter is not even polled (see PollDamageMeter).
 	if unitTarget == "target" then
-		if outgoingLogSeen or not InCombatLockdown() or IsInGroup() then return end
+		if outgoingLogSeen or not InCombatLockdown() then return end
 
 		-- schoolMask shares the numeric domain with the old combat log damage
 		-- schools, so it can color the amount and acts as evidence in tick
@@ -2565,19 +2669,28 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 		-- computed before attribution.
 		local damageType = (schoolMask and not (issecretvalue and issecretvalue(schoolMask))) and schoolMask or nil
 
+		local now = GetTime()
+		local inGroup = IsInGroup()
+		-- In a group, a wound on the target cannot name the attacker. Show
+		-- only what can be tied to the player by the game's own signals: a
+		-- fresh cast, a cadence follow-up, a school-matched tick of the one
+		-- spell with recent hits, or the swings the game itself flagged as
+		-- the player's extra attacks. Everything else is dropped - it is
+		-- somebody else's hit until proven otherwise.
+		local spellID, castTime = AttributeSoloWound(now, damageType, inGroup)
+		if inGroup and spellID == nil and now > extraAttackUntil then
+			LogDecision("wound amt=" .. SafeText(amount) .. " -> dropped (group, unattributable)")
+			return
+		end
 		if isWound then
-			local now = GetTime()
-			local spellID, castTime = AttributeSoloWound(now, damageType)
 			LogDecision("wound amt=" .. SafeText(amount) .. " school=" .. SafeText(damageType)
+				.. " grp=" .. tostring(inGroup)
 				.. " -> spell=" .. SafeText(spellID)
 				.. (castTime and (" castAge=" .. string_format("%.1f", now - castTime)) or ""))
 			local spellName = spellID and NonSecret(GetSpellInfo(spellID)) or nil
 			FeedOwnHit(spellID, spellName, amount, isCrit, damageType, castTime, false)
 		else
-			-- Outgoing miss (solo), attributed like a wound when possible.
-			local now = GetTime()
-			local spellID, castTime = AttributeSoloWound(now, nil)
-			LogDecision("miss " .. SafeText(action) .. " -> spell=" .. SafeText(spellID))
+			LogDecision("miss " .. SafeText(action) .. " grp=" .. tostring(inGroup) .. " -> spell=" .. SafeText(spellID))
 			ParserEventsHandler({eventType = "miss", sourceUnit = "player", missType = action,
 				recipientName = NonSecret(UnitName("target")),
 				skillID = spellID, skillName = spellID and NonSecret(GetSpellInfo(spellID)) or nil})
@@ -2602,6 +2715,16 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 		-- duplicate the meter's outgoing line, so heals are not shown here -
 		-- the meter feed (§4) covers the player's dealt healing.
 		if IsInGroup() then return end
+
+		-- The game's combat-text feed is the heal-on-player authority (it
+		-- names the healer); this branch is the solo fallback, debounced
+		-- against it so a heal is never shown twice.
+		local nowDebounce = GetTime()
+		if combatTextHealSeenAt > 0 and (nowDebounce - combatTextHealSeenAt) < 0.5 then
+			LogDecision("unitcombat-heal -> dropped (game combat-text feed delivered it)")
+			return
+		end
+		unitCombatHealSeenAt = nowDebounce
 
 		local spellID, castTime
 		local now = GetTime()
@@ -2643,8 +2766,9 @@ local function Enable()
 	eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 	eventFrame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
 	if MikSBT.Client.isForever then
-		-- Solo Combat Feed (§1/§8): casts, combat routing, group changes,
-		-- and the health ledger for the live overheal estimate.
+		-- Solo Combat Feed (§1/§7/§8): casts, combat routing, group changes,
+		-- the health ledger for the live overheal estimate, and the game's
+		-- own floating-combat-text feed (heal attribution, extra attacks).
 		eventFrame:RegisterEvent("UNIT_COMBAT")
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
@@ -2653,6 +2777,12 @@ local function Enable()
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
 		eventFrame:RegisterEvent("UNIT_HEALTH")
 		eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+		if combatTextAvailable() then
+			eventFrame:RegisterEvent("COMBAT_TEXT_UPDATE")
+			-- The game's own combat text watches the player by default, but
+			-- claim it explicitly (same call Blizzard_CombatText makes).
+			pcall(C_CombatText.SetActiveUnit, "player")
+		end
 	end
 
 	-- Register the parser events handler.

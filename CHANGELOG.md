@@ -3,6 +3,40 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.0] - 2026-11-15
+
+### Added
+- **The game's own floating-combat-text feed (`COMBAT_TEXT_UPDATE` +
+  `C_CombatText.SetActiveUnit("player")`)**, the data source of Blizzard's
+  native combat text, now feeds MSBT:
+  - **Heals on the player with the healer's name** - the only sanctioned feed
+    that names the caster of a heal. Incoming heals from other players display
+    as `+X [Healer]` (in groups and solo); self-heals attribute to the cast
+    that just finished and mark it as a heal cast (it can never attribute
+    damage later).
+  - **`EXTRA_ATTACKS`** (Windfury-style extra swings) flags the player's own
+    upcoming extra swings, so they show as plain melee numbers even in groups.
+  - Returns may be Blizzard secret values mid-combat ("SecretReturns",
+    patch 12.0); every event is logged to the decision log, so a test dump
+    shows exactly what the feed delivered and how secret it was.
+- **Group mode: strict correlation instead of total discard.** In a group, a
+  wound on the target only shows when it can be tied to the player by the
+  game's own signals: a fresh cast, a melee-cadence follow-up, a
+  school-matched tick of the one spell with recent hits, or game-flagged extra
+  attack swings. Everything else is dropped (group, unattributable) - it is
+  somebody else's hit until proven otherwise. The weaker "old cast" rule is
+  solo-only. Solo behaviour is unchanged (everything is yours there).
+- **Cross-debounce** between the game's combat-text feed and `UNIT_COMBAT`
+  heals: a heal is never shown twice; `UNIT_COMBAT` remains the authority for
+  incoming damage and the solo heal fallback.
+
+### Fixed
+- Group-mode testing was a dead end in v1.5.1: the test dump proved the meter
+  (`C_DamageMeter`) returns secret values for every entry mid-combat, and the
+  group gate discarded all target wounds before the classifier ever saw them
+  (empty decision log). Group play now runs on the strict-correlation path
+  above instead of depending on a feed that is sealed mid-combat.
+
 ## [1.5.1] - 2026-11-15
 
 ### Fixed
