@@ -958,11 +958,18 @@ local function HandleCombatLogTriggers(timestamp, event, hideCaster, sourceGUID,
 			-- Loop through each condition triplet.
 			for position = 1, #eventConditions, 3 do
 				-- Test the condition and if it fails, don't waste time checking other conditions.
+				-- Forever: comparing a Secret Value ("==", "<") throws; a pcall
+				-- turns that into a harmless "condition not met" instead of an
+				-- addon error. Unknown condition/test functions still behave as
+				-- before (the condition is ignored).
 				local conditionFunc = eventConditionFuncs[eventConditions[position]]
 				local testFunc = testFuncs[eventConditions[position + 1]]
-				if conditionFunc and testFunc and not conditionFunc(testFunc, parserEvent, eventConditions[position + 2]) then
-					doFire = false
-					break
+				if conditionFunc and testFunc then
+					local okCond, condMet = pcall(conditionFunc, testFunc, parserEvent, eventConditions[position + 2])
+					if not okCond or not condMet then
+						doFire = false
+						break
+					end
 				end
 			end -- Conditions loop.
 

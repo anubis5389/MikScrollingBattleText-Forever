@@ -407,12 +407,25 @@ local function FormatEvent(message, amount, damageType, overhealAmount, overkill
 		--if (powerType == powerTypes["ECLIPSE"]) then formattedAmount = math_abs(amount) end
 
 		-- Shorten amount with SI suffixes or separate into digit groups depending on options.
-		-- Forever: secret amounts can't be shortened or grouped; pass them through raw.
+		-- Forever: plain numbers use MSBT's formatter; secret amounts can be
+		-- shortened or grouped via Blizzard's native C++ formatters
+		-- (AbbreviateNumbers / BreakUpLargeNumbers, marked AllowedWhenTainted).
+		-- A pre-joined secret string ("a + b" from the secret merge) fails the
+		-- pcall and passes through unchanged.
 		if not (isSecretAmount or (issecretvalue and issecretvalue(formattedAmount))) then
 			if currentProfile.shortenNumbers then
 				formattedAmount = ShortenNumber(formattedAmount, currentProfile.shortenNumberPrecision)
 			elseif currentProfile.groupNumbers then
 				formattedAmount = FormatLargeNumber(formattedAmount)
+			end
+		else
+			local secretFormatter = currentProfile.shortenNumbers and _G.AbbreviateNumbers
+				or (currentProfile.groupNumbers and (_G.BreakUpLargeNumbers or FormatLargeNumber))
+			if type(secretFormatter) == "function" then
+				local okFmt, fmtResult = pcall(secretFormatter, formattedAmount)
+				if okFmt and fmtResult ~= nil then
+					formattedAmount = fmtResult
+				end
 			end
 		end
 
@@ -826,13 +839,37 @@ local function MergeEvents(numEvents, currentProfile)
 				unmergedEvent.eventMerged = true
 
 				-- Total the amount if there is one.
+				-- Forever: secret amounts can't be added with "+", so join them as
+				-- "<a1> + <a2>" (the native secret concatenation allowed by the
+				-- engine) while still incrementing numMerged for "[N Hits]".
 				if unmergedEvent.amount then
-					mergedEvent.amount = (mergedEvent.amount or 0) + unmergedEvent.amount
+					local mergedSecret = mergedEvent.amount ~= nil and issecretvalue and issecretvalue(mergedEvent.amount)
+					local unmergedSecret = issecretvalue and issecretvalue(unmergedEvent.amount)
+					if mergedSecret or unmergedSecret then
+						local function fmtPart(val)
+							if val == nil then return "0" end
+							local secretFormatter = currentProfile.shortenNumbers and _G.AbbreviateNumbers
+								or (currentProfile.groupNumbers and (_G.BreakUpLargeNumbers or FormatLargeNumber))
+							if type(secretFormatter) == "function" then
+								local okFmt, fmtVal = pcall(secretFormatter, val)
+								if okFmt and fmtVal ~= nil then return fmtVal end
+							end
+							return val
+						end
+						local left = mergedEvent.secretJoined and mergedEvent.amount or fmtPart(mergedEvent.amount)
+						local right = fmtPart(unmergedEvent.amount)
+						mergedEvent.amount = left .. " + " .. right
+						mergedEvent.secretJoined = true
+					else
+						mergedEvent.amount = (mergedEvent.amount or 0) + unmergedEvent.amount
+					end
 				end
 
 				-- Total the overheal amount if there is one.
 				if unmergedEvent.overhealAmount then
-					mergedEvent.overhealAmount = (mergedEvent.overhealAmount or 0) + unmergedEvent.overhealAmount
+					if not (issecretvalue and (issecretvalue(mergedEvent.overhealAmount) or issecretvalue(unmergedEvent.overhealAmount))) then
+						mergedEvent.overhealAmount = (mergedEvent.overhealAmount or 0) + unmergedEvent.overhealAmount
+					end
 				end
 
 				-- Increment the number of merged events.
@@ -1856,16 +1893,16 @@ local TICK_TRACKING_WINDOW = 7.0
 -- Solo attribution windows. The heal window is short because a heal event
 -- always fires right when its cast completes - and a HoT tick arriving later
 -- must not mark an unrelated fresh damage cast as a heal.
-local WOUND_ATTRIBUTION_WINDOW = 4.0
-local HEAL_ATTRIBUTION_WINDOW = 1.0
+local attribWindows = { wound = 4.0, heal = 1.0 }
 
 -- Meter poll cadence, type constants, and the pending-flush age: meter deltas
 -- aggregate per spell and flush as one line per second instead of one
 -- fragment per 0.5s poll.
-local METER_POLL_INTERVAL = 0.5
-local METER_PENDING_FLUSH = 1.0
-local DM_DAMAGEDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.DamageDone) or 0
-local DM_HEALINGDONE = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.HealingDone) or 2
+local meterTimers = { poll = 0.5, pendingFlush = 1.0 }
+local meterTypes = {
+	done = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.DamageDone) or 0,
+	heal = (Enum and Enum.DamageMeterType and Enum.DamageMeterType.HealingDone) or 2,
+}
 
 -- Per-spell state: { mode = "direct"|"sustained", lastTime, spacedHits,
 -- school, amount, hits, overheal, pendingSince }. Direct mode shows every
@@ -1885,11 +1922,34 @@ local function LogDecision(text)
 	if #decisionLog > 200 then table_remove(decisionLog, 1) end
 end
 
+-- Spell facts gathered from public APIs (no secrecy involved). Packed into
+-- one table (the main chunk is near Lua's 200-locals compile limit).
+--   schools: learned per spell from its confirmed direct-cast hit (a wound
+--     landing right after that spell's cast), so a later wound whose school
+--     mismatches the spell's cannot be attributed to it (a teammate's fire
+--     blast must not join the player's frost spell).
+--   helpful: C_Spell.IsSpellHelpful marks heals and buffs - they never deal
+--     the wound the fresh-cast rule would otherwise hand them.
+local spellFacts = { schools = {}, helpful = {} }
+
+local function SpellIsHelpful(spellID)
+	local cached = spellFacts.helpful[spellID]
+	if cached ~= nil then return cached end
+	local helpful = false
+	if C_Spell and C_Spell.IsSpellHelpful then
+		local ok, res = pcall(C_Spell.IsSpellHelpful, spellID)
+		if ok then helpful = res == true end
+	end
+	spellFacts.helpful[spellID] = helpful
+	return helpful
+end
+
 -- Attributes a solo UNIT_COMBAT wound on the target to a spell (or nil for
 -- the classic plain melee number). damageType is the wound's school - the
--- school is evidence: a fire wound cannot be a weapon swing. In strict mode
--- (groups) the weaker "old cast" rule is skipped: a hit 2s after a cast may
--- belong to anyone.
+-- school is evidence: a fire wound cannot be a weapon swing, and a wound
+-- whose school mismatches the cast spell's learned school is not its hit.
+-- In strict mode (groups) the weaker "old cast" rule is skipped: a hit 2s
+-- after a cast may belong to anyone.
 --   1. a fresh cast (within DIRECT_HIT_WINDOW): the wound is its direct hit
 --      or application tick - always that spell;
 --   2. exactly one spell with recent hits whose school matches: the wound is
@@ -1899,9 +1959,17 @@ end
 --      (shown immediately);
 --   4. otherwise unattributed: plain melee number (weapon swings, procs).
 local function AttributeSoloWound(now, damageType, strict)
-	-- 1. Fresh cast.
-	if lastCast.spellID and (now - lastCast.time) <= DIRECT_HIT_WINDOW and not playerHealSpellIDs[lastCast.spellID] then
-		return lastCast.spellID, lastCast.time
+	-- 1. Fresh cast. The wound must fit the spell: heal/utility casts never
+	--    attribute, and a wound whose school mismatches the spell's learned
+	--    school is not this spell's hit (it is somebody else's that happened
+	--    to land within the cast window).
+	if lastCast.spellID and (now - lastCast.time) <= DIRECT_HIT_WINDOW
+		and not playerHealSpellIDs[lastCast.spellID]
+		and not SpellIsHelpful(lastCast.spellID) then
+		local learnedSchool = spellFacts.schools[lastCast.spellID]
+		if damageType == nil or learnedSchool == nil or damageType == learnedSchool then
+			return lastCast.spellID, lastCast.time
+		end
 	end
 	-- 2. A single spell with recent hits owns its ticks (school-matched).
 	local active, activeSchool, ambiguous
@@ -1915,9 +1983,11 @@ local function AttributeSoloWound(now, damageType, strict)
 		return active, nil
 	end
 	-- 3. An old cast within the wound window (SOLO only - in a group a hit
-	--    arriving 2s after a cast may belong to anyone).
-	if not strict and lastCast.spellID and (now - lastCast.time) <= WOUND_ATTRIBUTION_WINDOW
-		and not playerHealSpellIDs[lastCast.spellID] then
+	--    arriving 2s after a cast may belong to anyone). Heal/utility casts
+	--    never attribute.
+	if not strict and lastCast.spellID and (now - lastCast.time) <= attribWindows.wound
+		and not playerHealSpellIDs[lastCast.spellID]
+		and not SpellIsHelpful(lastCast.spellID) then
 		return lastCast.spellID, lastCast.time
 	end
 	-- 4. Unattributed.
@@ -1928,7 +1998,7 @@ end
 -- Flushes one sustained group as a single MSBT event: "<Spell> (<hits>)
 -- <total>" (plus the accumulated overheal for heals). Called when the spell
 -- has been quiet for SUSTAINED_IDLE_FLUSH seconds, when its meter-pending
--- amount is METER_PENDING_FLUSH seconds old, or at combat end.
+-- amount is meterTimers.pendingFlush seconds old, or at combat end.
 -- ****************************************************************************
 local function FlushSustained(states, spellID, eventType)
 	local state = states[spellID]
@@ -1975,6 +2045,13 @@ end
 --***************************************************************************
 local function FeedOwnHit(spellID, spellName, amount, isCrit, damageType, castTime, isMeterDelta)
 	if amount == nil then return end
+
+	-- Learn the spell's damage school from a cast-confirmed hit: a wound that
+	-- lands right after the player cast this spell is provably its hit, so
+	-- its school becomes the spell's. Later attribution uses it as evidence.
+	if spellID ~= nil and damageType ~= nil and castTime ~= nil and spellFacts.schools[spellID] == nil then
+		spellFacts.schools[spellID] = damageType
+	end
 
 	-- Weapon swing / unattributed hit: the classic plain melee number.
 	if spellID == nil then
@@ -2197,21 +2274,25 @@ end
 -- Polls one C_DamageMeter type for the player and feeds each spell's
 -- newly-registered amount into the shared classifier. The hit-count estimate
 -- for grouped spells is one hit per 0.5s poll window in which the spell grew
--- (a window rarely contains two hits of the same spell).
+-- (a window rarely contains two hits of the same spell). Returns true when
+-- any entry came back readable (plain numbers) - the signal the poll
+-- back-off uses to resume full cadence.
 local function PollDamageMeterSource(damageMeterType, isHeal)
 	local okGUID, playerGUID = pcall(UnitGUID, "player")
-	if not okGUID or not playerGUID then return end
+	if not okGUID or not playerGUID then return false end
 
 	local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, damageMeterType, playerGUID)
-	if not okSource or not source then return end
+	if not okSource or not source then return false end
 
 	local okSpells, combatSpells = pcall(function() return source.combatSpells end)
-	if not okSpells or type(combatSpells) ~= "table" then return end
+	if not okSpells or type(combatSpells) ~= "table" then return false end
 
+	local sawPlainEntry = false
 	for _, entry in ipairs(combatSpells) do
 		local spellID = SafeAddZero(entry.spellID)
 		local totalAmount = SafeAddZero(entry.totalAmount)
 		if spellID and totalAmount and totalAmount > 0 then
+			sawPlainEntry = true
 			local key = damageMeterType .. ":" .. spellID
 			local previousAmount = damageMeterLastTotals[key] or 0
 
@@ -2242,6 +2323,7 @@ local function PollDamageMeterSource(damageMeterType, isHeal)
 			end
 		end
 	end
+	return sawPlainEntry
 end
 
 -- ****************************************************************************
@@ -2258,10 +2340,10 @@ end
 -- on the next /reload or logout) and are KEPT across fights (capped), so a
 -- manual capture after the fight still carries the mid-combat evidence.
 -- ****************************************************************************
-local combatMeterSampleLines = {}
-local combatMeterSampleCount = 0
-local meterCombatStartTime = nil
-local lastMeterSampleTime = 0
+-- (State packed into one table - the main chunk is near Lua's 200-locals
+-- compile limit. manualLines holds the last manual /run capture so the
+-- automatic samples never overwrite it.)
+local meterSampler = { lines = {}, count = 0, startTime = nil, lastTime = 0, manualLines = nil }
 
 -- Describes one combatSpells entry the way the engine consumes it: does the
 -- SafeAddZero gate ("value + 0" in a pcall) succeed, i.e. is the value plain?
@@ -2285,13 +2367,13 @@ end
 local function SampleMeterCombatState()
 	if not C_DamageMeter or not InCombatLockdown() then return end
 	local now = GetTime()
-	if now - lastMeterSampleTime < 5 then return end
-	lastMeterSampleTime = now
-	if combatMeterSampleCount >= 8 then return end
-	combatMeterSampleCount = combatMeterSampleCount + 1
+	if now - meterSampler.lastTime < 5 then return end
+	meterSampler.lastTime = now
+	if meterSampler.count >= 8 then return end
+	meterSampler.count = meterSampler.count + 1
 
 	local okGUID, playerGUID = pcall(UnitGUID, "player")
-	local parts = { "sample#" .. combatMeterSampleCount .. " t=+" .. string_format("%.0f", now - (meterCombatStartTime or now)) .. "s" }
+	local parts = { "sample#" .. meterSampler.count .. " t=+" .. string_format("%.0f", now - (meterSampler.startTime or now)) .. "s" }
 	for _, spec in ipairs({ { "DD", Enum.DamageMeterType.DamageDone }, { "HD", Enum.DamageMeterType.HealingDone } }) do
 		local okSource, source = pcall(C_DamageMeter.GetCombatSessionSourceFromType, 0, spec[2], playerGUID)
 		if not okSource or not source or type(source.combatSpells) ~= "table" then
@@ -2303,21 +2385,51 @@ local function SampleMeterCombatState()
 			end
 		end
 	end
-	combatMeterSampleLines[#combatMeterSampleLines + 1] = table.concat(parts, " ")
-	if #combatMeterSampleLines > 100 then table_remove(combatMeterSampleLines, 1) end
-	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = combatMeterSampleLines }
+	meterSampler.lines[#meterSampler.lines + 1] = table.concat(parts, " ")
+	if #meterSampler.lines > 100 then table_remove(meterSampler.lines, 1) end
+	-- Auto samples must never overwrite a manual /run capture: the capture is
+	-- kept (manualLines) and the current decision log is merged in, so every
+	-- dump carries both the samples and how each hit was attributed.
+	local merged = {}
+	if meterSampler.manualLines then
+		for _, line in ipairs(meterSampler.manualLines) do merged[#merged + 1] = line end
+	end
+	for _, line in ipairs(meterSampler.lines) do merged[#merged + 1] = line end
+	if #decisionLog > 0 then
+		merged[#merged + 1] = "=== solo feed decisions (how each wound/heal was attributed and shown) ==="
+		for _, line in ipairs(decisionLog) do merged[#merged + 1] = line end
+	end
+	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = merged }
 end
 
+-- Pilar 4 (back-off): on Forever the meter's spellID/totalAmount are Secret
+-- Values for the whole fight (proven by the mid-combat diagnostics dump), so
+-- polling every 0.5s only burns cycles. After meterBackoff.threshold consecutive
+-- all-secret polls the meter poll runs on every 4th tick (2s cadence) until a
+-- readable value reappears or combat ends - the feed recovers instantly if
+-- the client ever relaxes the restriction mid-fight.
+-- (State packed into one table - the main chunk is near Lua's 200-locals
+-- compile limit.)
+local meterBackoff = { threshold = 4, streak = 0, phase = 0 }
+
 -- ****************************************************************************
--- Runs every METER_POLL_INTERVAL while in combat: polls the meter feed in
+-- Runs every meterTimers.poll seconds while in combat: polls the meter feed in
 -- groups only (solo, UNIT_COMBAT is authoritative and the meter is not
 -- touched), flushes sustained groups that have gone quiet, and records the
 -- mid-combat diagnostics sample.
 -- ****************************************************************************
 local function PollDamageMeter()
+	meterBackoff.phase = (meterBackoff.phase + 1) % 4
 	if IsInGroup() then
-		PollDamageMeterSource(DM_DAMAGEDONE, false)
-		PollDamageMeterSource(DM_HEALINGDONE, true)
+		if meterBackoff.streak < meterBackoff.threshold or meterBackoff.phase == 1 then
+			local damagePlain = PollDamageMeterSource(meterTypes.done, false)
+			local healPlain = PollDamageMeterSource(meterTypes.heal, true)
+			if damagePlain or healPlain then
+				meterBackoff.streak = 0
+			else
+				meterBackoff.streak = meterBackoff.streak + 1
+			end
+		end
 	end
 
 	-- Flush sustained spells: meter-fed pending amounts flush by age (one
@@ -2327,7 +2439,7 @@ local function PollDamageMeter()
 	for spellID, state in pairs(hitStates) do
 		if state.mode == "sustained" then
 			if state.pendingSince ~= nil then
-				if (now - state.pendingSince) >= METER_PENDING_FLUSH then
+				if (now - state.pendingSince) >= meterTimers.pendingFlush then
 					FlushSustained(hitStates, spellID, "damage")
 				end
 			elseif (now - state.lastTime) >= SUSTAINED_IDLE_FLUSH then
@@ -2338,7 +2450,7 @@ local function PollDamageMeter()
 	for spellID, state in pairs(healStates) do
 		if state.mode == "sustained" then
 			if state.pendingSince ~= nil then
-				if (now - state.pendingSince) >= METER_PENDING_FLUSH then
+				if (now - state.pendingSince) >= meterTimers.pendingFlush then
 					FlushSustained(healStates, spellID, "heal")
 				end
 			elseif (now - state.lastTime) >= SUSTAINED_IDLE_FLUSH then
@@ -2376,7 +2488,7 @@ end
 -- lost).
 local function SaveMeterDiagnostics(lines)
 	local merged = {}
-	for _, line in ipairs(combatMeterSampleLines) do merged[#merged + 1] = line end
+	for _, line in ipairs(meterSampler.lines) do merged[#merged + 1] = line end
 	merged[#merged + 1] = "=== manual /run capture " .. date("%H:%M:%S") .. " ==="
 	for _, line in ipairs(lines) do merged[#merged + 1] = line end
 	if #decisionLog > 0 then
@@ -2384,6 +2496,9 @@ local function SaveMeterDiagnostics(lines)
 		for _, line in ipairs(decisionLog) do merged[#merged + 1] = line end
 	end
 	MSBT_DebugDiagnostics = { capturedAt = date("%Y-%m-%d %H:%M:%S"), lines = merged }
+	-- The manual capture must survive later automatic samples: keep it in the
+	-- sampler so every subsequent dump still carries it.
+	meterSampler.manualLines = merged
 end
 
 function MikSBT.DebugMeterInfo()
@@ -2457,14 +2572,23 @@ local function StartCombatFeed()
 	-- In-combat meter diagnostics: samples accumulate ACROSS fights (capped;
 	-- see SampleMeterCombatState) so a /run DebugMeterInfo() after the fight
 	-- still carries the mid-combat evidence - only a marker is added per fight.
-	combatMeterSampleCount = 0
-	lastMeterSampleTime = 0
-	meterCombatStartTime = GetTime()
-	combatMeterSampleLines[#combatMeterSampleLines + 1] = "--- fight start ---"
+	meterSampler.count = 0
+	meterSampler.lastTime = 0
+	meterSampler.startTime = GetTime()
+	meterSampler.lines[#meterSampler.lines + 1] = "--- fight start ---"
 	decisionLog[#decisionLog + 1] = "--- fight start ---"
 	while #decisionLog > 200 do table_remove(decisionLog, 1) end
 
-	damageMeterTicker = C_Timer.NewTicker(METER_POLL_INTERVAL, PollDamageMeter)
+	-- The ticker callback is xpcall-guarded too: a poll error must not kill
+	-- the whole combat feed silently.
+	damageMeterTicker = C_Timer.NewTicker(meterTimers.poll, function(...)
+		local ok, err = xpcall(PollDamageMeter, tostring)
+		if not ok then
+			local msg = "MSBT ERROR [meter-poll]: " .. tostring(err)
+			print(msg)
+			LogDecision(msg)
+		end
+	end)
 end
 
 -- ****************************************************************************
@@ -2475,6 +2599,10 @@ local function StopCombatFeed()
 		damageMeterTicker:Cancel()
 		damageMeterTicker = nil
 	end
+
+	-- Reset the meter poll back-off: the next fight starts at full cadence.
+	meterBackoff.streak = 0
+	meterBackoff.phase = 0
 
 	-- Show the tail of the fight instead of dropping it because the idle
 	-- flush never came.
@@ -2538,7 +2666,7 @@ local combatTextHealTypes = {
 	PERIODIC_HEAL = true, PERIODIC_HEAL_CRIT = true, PERIODIC_HEAL_ABSORB = true,
 }
 
-local unitCombatHealSeenAt, combatTextHealSeenAt = 0, 0
+local healSeenAt = { unitCombat = 0, combatText = 0 }
 local extraAttackUntil = 0
 
 local function combatTextAvailable()
@@ -2572,11 +2700,11 @@ function eventFrame:COMBAT_TEXT_UPDATE(messageType)
 	end
 	local nameSecret = sourceName ~= nil and issecretvalue ~= nil and issecretvalue(sourceName) or false
 	local amountSecret = amount ~= nil and issecretvalue ~= nil and issecretvalue(amount) or false
-	combatTextHealSeenAt = GetTime()
+	healSeenAt.combatText = GetTime()
 	LogDecision("ctu-heal " .. SafeText(messageType) .. " src=" .. SafeText(sourceName)
 		.. " srcSecret=" .. tostring(nameSecret) .. " amtSecret=" .. tostring(amountSecret))
 
-	if unitCombatHealSeenAt > 0 and (GetTime() - unitCombatHealSeenAt) < 0.5 then
+	if healSeenAt.unitCombat > 0 and (GetTime() - healSeenAt.unitCombat) < 0.5 then
 		LogDecision("ctu-heal -> dropped (UNIT_COMBAT delivered it first)")
 		return
 	end
@@ -2592,7 +2720,7 @@ function eventFrame:COMBAT_TEXT_UPDATE(messageType)
 		-- heal so it can never attribute damage later).
 		local spellID, castTime
 		local now = GetTime()
-		if lastCast.spellID and (now - lastCast.time) <= HEAL_ATTRIBUTION_WINDOW then
+		if lastCast.spellID and (now - lastCast.time) <= attribWindows.heal then
 			spellID, castTime = lastCast.spellID, lastCast.time
 			playerHealSpellIDs[spellID] = true
 		end
@@ -2620,6 +2748,68 @@ end
 -------------------------------------------------------------------------------
 -- §8 UNIT_COMBAT router: the Solo Combat Feed's raw signal source.
 -------------------------------------------------------------------------------
+
+-- SwingWatcher: PLAYER_SWING (SwingTimerDocumentation) fires in the frame of
+-- the player's OWN weapon swing - MainHand / OffHand / Ranged per
+-- Enum.PlayerSwingType - with no secrecy rule. It is the only server-side
+-- signal that says "the player swung now". On Forever, a swing's wound lands
+-- 0.42-0.74s after the event (one-hander / staff), so every wound claims one
+-- open swing slot: a school-less (white) wound that cannot claim one is not
+-- the player's swing. Extra attacks (Windfury) and pet swings send no
+-- PLAYER_SWING; extra attacks are covered by the EXTRA_ATTACKS window, and
+-- pet hits are pet-side data. If the event has never fired on this client,
+-- the auto-attack toggle remains the fallback evidence.
+-- (State packed into one table: the main chunk is near Lua's 200-locals
+-- compile limit - exceeding it aborts the whole file at load.)
+local swingWatcher = {
+	slots = {},        -- open PLAYER_SWING times, oldest first
+	eventSeen = false, -- PLAYER_SWING has fired at least once
+	hands = nil,       -- Enum.PlayerSwingType values, resolved lazily
+	-- Wound lag after the swing event: observed 0.42-0.74s; the small negative
+	-- margin absorbs same-frame ordering differences.
+	minLag = -0.05,
+	maxLag = 1.0,
+	slotTTL = 2.0,
+}
+
+function eventFrame:PLAYER_SWING(swingDuration, swingType)
+	swingWatcher.eventSeen = true
+	if swingWatcher.hands == nil then
+		local hands = {}
+		local kinds = Enum and Enum.PlayerSwingType
+		if kinds then
+			hands[kinds.MainHand] = true
+			hands[kinds.OffHand] = true
+			hands[kinds.Ranged] = true
+		end
+		swingWatcher.hands = hands
+	end
+	-- Unknown swing types (a changed enum) still count as the player's swings.
+	if type(swingType) == "number" and next(swingWatcher.hands) ~= nil
+		and not swingWatcher.hands[swingType] then
+		return
+	end
+	swingWatcher.slots[#swingWatcher.slots + 1] = GetTime()
+end
+
+-- Claims one open swing slot for a wound landing now: true when a
+-- PLAYER_SWING arrived within the wound-lag window. The claimed slot is
+-- consumed, so dual wield (two swings per round) feeds two wounds and a
+-- teammate's white hit cannot claim a slot that the player's own wound needs.
+local function ClaimOwnSwingLag(now)
+	local slots = swingWatcher.slots
+	while #slots > 0 and (now - slots[1]) > swingWatcher.slotTTL do
+		table_remove(slots, 1)
+	end
+	for i, swingAt in ipairs(slots) do
+		local lag = now - swingAt
+		if lag >= swingWatcher.minLag and lag <= swingWatcher.maxLag then
+			table_remove(slots, i)
+			return true
+		end
+	end
+	return false
+end
 
 -- True while the player's melee auto-attack toggle is engaged (spell 6603,
 -- "Attack"). This is the game's own switch for the white swings - an old,
@@ -2696,16 +2886,31 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 		-- cast rule would happily eat them - the v1.6.0 dump showed white
 		-- swings entering a Stormstrike group), so they bypass spell
 		-- attribution entirely and show as the classic plain melee number.
-		-- Solo everything is the player's anyway; in a group they only show
-		-- while the player's own auto-attack is engaged or during the game's
-		-- extra-attack window. MSBT's swing merge folds repeats into
-		-- "[N hits]" lines, so density stays readable.
+		-- Solo everything is the player's anyway. In a group the evidence is
+		-- tiered: during the game's extra-attack window the swings are the
+		-- player's; once PLAYER_SWING has proven itself on this client, a
+		-- wound only shows when it claims one of the player's own swing
+		-- slots (the toggle alone proves nothing - it is engaged for the
+		-- whole fight, so party members' white hits used to surface as the
+		-- player's); without the swing event, fall back to the toggle.
+		-- MSBT's swing merge folds repeats into "[N hits]" lines, so density
+		-- stays readable.
 		if isWound and damageType == nil then
-			if not inGroup or now <= extraAttackUntil or PlayerAutoAttacking() then
+			local showSwing
+			if not inGroup then
+				showSwing = true
+			elseif now <= extraAttackUntil then
+				showSwing = true
+			elseif swingWatcher.eventSeen then
+				showSwing = ClaimOwnSwingLag(now)
+			else
+				showSwing = PlayerAutoAttacking()
+			end
+			if showSwing then
 				LogDecision("wound amt=" .. SafeText(amount) .. " school=nil -> plain white swing show")
 				FeedOwnHit(nil, nil, amount, isCrit, nil, nil, false)
 			else
-				LogDecision("wound amt=" .. SafeText(amount) .. " school=nil -> dropped (group, not auto-attacking)")
+				LogDecision("wound amt=" .. SafeText(amount) .. " school=nil -> dropped (group, no own swing slot)")
 			end
 			return
 		end
@@ -2760,15 +2965,15 @@ function eventFrame:UNIT_COMBAT(unitTarget, action, flagText, amount, schoolMask
 		-- names the healer); this branch is the solo fallback, debounced
 		-- against it so a heal is never shown twice.
 		local nowDebounce = GetTime()
-		if combatTextHealSeenAt > 0 and (nowDebounce - combatTextHealSeenAt) < 0.5 then
+		if healSeenAt.combatText > 0 and (nowDebounce - healSeenAt.combatText) < 0.5 then
 			LogDecision("unitcombat-heal -> dropped (game combat-text feed delivered it)")
 			return
 		end
-		unitCombatHealSeenAt = nowDebounce
+		healSeenAt.unitCombat = nowDebounce
 
 		local spellID, castTime
 		local now = GetTime()
-		if lastCast.spellID and (now - lastCast.time) <= HEAL_ATTRIBUTION_WINDOW then
+		if lastCast.spellID and (now - lastCast.time) <= attribWindows.heal then
 			spellID, castTime = lastCast.spellID, lastCast.time
 			playerHealSpellIDs[spellID] = true
 		end
@@ -2817,6 +3022,8 @@ local function Enable()
 		eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
 		eventFrame:RegisterEvent("UNIT_HEALTH")
 		eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+		-- The player's own weapon swings (white-swing evidence in groups).
+		eventFrame:RegisterEvent("PLAYER_SWING")
 		if combatTextAvailable() then
 			eventFrame:RegisterEvent("COMBAT_TEXT_UPDATE")
 			-- The game's own combat text watches the player by default, but
@@ -2848,11 +3055,30 @@ end
 -------------------------------------------------------------------------------
 
 -- Setup event frame.
+-- Setup event frame. Every handler call is wrapped so a single failing
+-- handler can never silently kill the feed again: the error is printed to
+-- the chat frame (visible without any /run) and logged in the decision log.
+local function SafeDispatch(handler, self, event, ...)
+	if not handler then return end
+	local ok, err = xpcall(handler, function(e)
+		-- debugstack is a WoW global; guard it in case a client ever drops it.
+		local stack = ""
+		if debugstack then
+			local okStack, res = pcall(debugstack, 2, 1, 0)
+			if okStack then stack = res or "" end
+		end
+		return tostring(e) .. (stack ~= "" and (" @ " .. stack) or "")
+	end, self, ...)
+	if not ok then
+		local msg = "MSBT ERROR [" .. tostring(event) .. "]: " .. tostring(err)
+		print(msg)
+		LogDecision(msg)
+	end
+end
+
 eventFrame:Hide()
 eventFrame:SetScript("OnEvent", function(self, event, ...)
-	if self[event] then
-		self[event](self, ...)
-	end
+	SafeDispatch(self[event], self, event, ...)
 end)
 eventFrame:SetScript("OnUpdate", OnUpdateEventFrame)
 
@@ -2947,3 +3173,9 @@ MikSBT.IterateScrollAreas			= MSBTAnimations.IterateScrollAreas
 MikSBT.IterateSounds				= MSBTMedia.IterateSounds
 MikSBT.DisplayMessage				= MSBTAnimations.DisplayMessage
 MikSBT.IsModDisabled				= MSBTProfiles.IsModDisabled
+
+-- Load announcement: the addon must never fail silently again. If this line
+-- is missing from the chat frame, the whole file failed to compile (see
+-- Lua's 200-locals-per-chunk limit) and the client's Logs\FrameXML.log says
+-- exactly where.
+print("|cff00ccffMik's Scrolling Battle Text v1.8.0 cargado|r")

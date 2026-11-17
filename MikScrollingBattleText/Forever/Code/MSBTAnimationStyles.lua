@@ -685,7 +685,10 @@ local function InitHorizontal(newDisplayEvent, activeDisplayEvents, direction, b
 	end
 
 	-- Calculate the left and right offsets from the anchor point.
-	local fontStringWidth = newDisplayEvent.fontString:GetStringWidth()
+	-- Forever: GetStringWidth() can return nil or a secret value when the
+	-- fontString contains a secret amount; fall back to 0 to keep math safe.
+	local okWidth, rawWidth = pcall(newDisplayEvent.fontString.GetStringWidth, newDisplayEvent.fontString)
+	local fontStringWidth = (okWidth and type(rawWidth) == "number" and not (issecretvalue and issecretvalue(rawWidth))) and rawWidth or 0
 	if anchorPoint == "BOTTOMLEFT" then
 		newDisplayEvent.offsetLeft = 0
 		newDisplayEvent.offsetRight = fontStringWidth

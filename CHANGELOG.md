@@ -3,6 +3,71 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.0] - 2026-11-15
+
+### Fixed
+- **Foreign damage surfacing as the player's own in groups** (small numbers
+  that belong to nobody's rotation - not glancing, not parry/block): three
+  leaks closed.
+  - *White swings*: the auto-attack toggle (spell 6603) is engaged for the
+    whole fight, so every school-less wound on the target passed the old
+    gate - including party members' white hits. Outgoing white wounds in a
+    group must now claim one of the player's own `PLAYER_SWING` slots
+    (the event fires only for the player's own MainHand/OffHand/Ranged
+    swings; on Forever a swing's wound lands 0.42-0.74s after the event, so
+    each wound consumes one open slot). Solo behaviour is unchanged, and
+    the game's `EXTRA_ATTACKS` window (Windfury, etc.) still shows without
+    a slot; if `PLAYER_SWING` never fires on a client, the old toggle
+    fallback applies. The decision log records every claim/drop
+    (`-> plain white swing show` / `dropped (group, no own swing slot)`).
+  - *Fresh-cast attribution*: any wound landing within 1.2s of a cast used
+    to take the cast's name even when a party member's hit arrived in that
+    window. Rule 1 now requires the wound's school to match the spell's
+    learned school (learned from the spell's own confirmed direct-cast
+    hits), and heal/utility casts (per `C_Spell.IsSpellHelpful`) never
+    attribute damage in rules 1 and 3.
+  - *Old-cast attribution* (solo rule 3) also skips helpful/heal casts.
+
+### Changed
+- **Secret amounts are formatted natively** (Pillar 3): when an amount is a
+  Secret Value and the profile shortens or groups numbers, the amount goes
+  through Blizzard's own C++ formatters (`AbbreviateNumbers` /
+  `BreakUpLargeNumbers`, marked `AllowedWhenTainted` on 12.x) in a pcall
+  instead of displaying unformatted - `1.2M` / `1,245,892` instead of
+  raw digits.
+- **Merging tolerates secret amounts**: instead of erroring on secret
+  arithmetic, like-hit merges join their amounts as `<a> + <b>` (native
+  secret concatenation) while still producing the `[N Hits]` trailer; the
+  overheal total simply skips secret participants.
+- **`GetStringWidth()` hardened** in the horizontal-offset code: it can
+  return a secret/nil for font strings holding secret amounts; falls back
+  to width 0 instead of breaking the animation.
+- **Trigger conditions are pcall-guarded** (MSBTTriggers): comparing a
+  Secret Value amount with `==`/`<` now counts as "condition not met"
+  instead of throwing an addon error.
+- **`C_DamageMeter` polling backs off mid-combat** (Pillar 4): the
+  mid-combat diagnostics proved the meter's spellID/totalAmount are Secret
+  Values for the entire fight on Forever, so after 4 consecutive all-secret
+  polls the group feed drops to a 2s cadence (and resets instantly if the
+  client ever returns readable values or combat ends).
+- **Nothing loaded at all (total failure of damage AND heals)**:
+  `MSBTMain.lua` hit Lua's hard limit of 200 local variables per chunk
+  (`main function has more than 200 local variables`, caught in the
+  client's `Logs\FrameXML.log`) after the swing-tracking work, so the
+  entire engine file aborted at compile time - no handler registered,
+  nothing shown anywhere, with a cascade of nil-call errors in
+  MSBTAnimations/MSBTProfiles. The feed's state tables are now packed
+  (`swingWatcher`, `spellFacts`, `meterBackoff`, `meterSampler`,
+  `meterTimers`/`meterTypes`, `healSeenAt`), well clear of the limit.
+- **Failures can never be silent again**: every event dispatch and the
+  meter-poll ticker are xpcall-guarded and print `MSBT ERROR [event]` to
+  the chat frame on failure, the addon announces its version on load
+  ("MSBT v1.8.0 cargado" - if that line is missing, the file did not
+  compile and `Logs\FrameXML.log` says where), and the automatic
+  in-combat diagnostics samples no longer overwrite a manual
+  `/run MikSBT.DebugMeterInfo()` capture (both survive into the
+  SavedVariables dump).
+
 ## [1.7.0] - 2026-11-15
 
 ### Fixed
